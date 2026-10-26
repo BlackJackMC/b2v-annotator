@@ -3,6 +3,7 @@ from pymongo.errors import DuplicateKeyError
 from fastapi import HTTPException, status
 from typing import List
 from beanie import UpdateResponse
+from beanie.operators import In
 
 from backend.domain.models import AnnotationTask
 from backend.infra.config import settings
@@ -11,9 +12,10 @@ from backend.app.schemas import ClaimTaskRequest, SubmitTaskRequest
 class TaskUseCase:
     @staticmethod
     async def check_status(task_ids: List[str]):
-        from beanie.operators import In
-        tasks = await AnnotationTask.find(In(AnnotationTask.task_id, task_ids)).to_list()
-        return [{"task_id": t.task_id, "status": t.status, "locked_by": t.locked_by} for t in tasks]
+        tasks = await AnnotationTask.find(
+            In(AnnotationTask.task_id, task_ids)
+        ).to_list()
+        return tasks
 
     @staticmethod
     async def claim_task(task_id: str, request: ClaimTaskRequest):
@@ -36,11 +38,14 @@ class TaskUseCase:
             updated_task = await AnnotationTask.find_one(
                 AnnotationTask.task_id == task_id,
                 AnnotationTask.status == "processing",
-                {"locked_at": {"$lt": timeout_threshold}} 
+                {"$or": [
+                    {"locked_at": {"$lt": timeout_threshold}},
+                    {"locked_by": request.user_id} 
+                ]}
             ).update(
                 {"$set": {"locked_by": request.user_id, "locked_at": now}},
                 response_type=UpdateResponse.NEW_DOCUMENT
-            )
+            ) # type: ignore
             
             if not updated_task:
                 raise HTTPException(
@@ -48,7 +53,25 @@ class TaskUseCase:
                     detail="Task is currently locked by someone else or already done."
                 )
                 
-            return {"message": "Task claim stolen (previous lock timed out)"}
+            return {"message": "Task claim stolen or resumed"}
+
+    @staticmethod
+    async def submit_task(task_id: str, request: SubmitTaskRequest):
+        task = await AnnotationTask.find_one(
+            AnnotationTask.task_id == task_id,
+            AnnotationTask.locked_by == request.user_id,
+            AnnotationTask.status == "processing"
+        ).update(
+            {"$set": {"status": "done", "result": request.result, "locked_by": None, "locked_at": None}},
+            response_type=UpdateResponse.NEW_DOCUMENT
+        ) # type: ignore
+        
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Task not found or lock expired."
+            )
+        return {"message": "Task completed successfully"}
 
     @staticmethod
     async def reclaim_task(task_id: str, request: ClaimTaskRequest):
@@ -60,7 +83,7 @@ class TaskUseCase:
         ).update(
             {"$set": {"status": "processing", "locked_by": request.user_id, "locked_at": now}},
             response_type=UpdateResponse.NEW_DOCUMENT
-        )
+        ) # type: ignore
         
         if not task:
             raise HTTPException(
@@ -70,7 +93,7 @@ class TaskUseCase:
             
         return {
             "message": "Task reclaimed for editing",
-            "existing_result": task.result
+            "existing_result": task.result 
         }
 
     @staticmethod
@@ -93,18 +116,3 @@ class TaskUseCase:
         else:
             await task.delete()
             return {"message": "Task unclaimed and removed from DB"}
-
-    @staticmethod
-    async def submit_task(task_id: str, request: SubmitTaskRequest):
-        task = await AnnotationTask.find_one(
-            AnnotationTask.task_id == task_id,
-            AnnotationTask.locked_by == request.user_id,
-            AnnotationTask.status == "processing"
-        )
-        if not task:
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, 
-                detail="You don't hold the lock for this task."
-            )
-        await task.update({"$set": {"status": "done", "result": request.result, "locked_at": None}})
-        return {"message": "Task completed successfully"}
