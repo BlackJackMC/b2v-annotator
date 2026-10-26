@@ -2,8 +2,8 @@
 .vscode
 __pycache__
 
-/data/keyframe/*
-!/data/keyframe/.gitkeep
+/data/*
+!/data/.gitkeep
 
-/data/obb/*
-!/data/obb/.gitkeep
+/output/*
+!/output/.gitkeep

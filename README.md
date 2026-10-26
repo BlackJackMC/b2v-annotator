@@ -1,15 +1,21 @@
 # b2v-annotator
-A tool to annotate ground-truth for Board2vec
+A tool to annotate ground-truth for Board2vec. Backend made by me and frontend made by Gemini
 
 ## Folder structure
 ```
 .
-├── README.md
+.
+├── data: input data
+│   ├── keyframes
+│   └── obb
 └── src
-    ├── app.py: app to use
-    └── backend: for server
-        ├── app
-        ├── domain
-        ├── infra
-        └── main.py
+    ├── backend: server to sync progress
+    │   ├── app
+    │   ├── domain
+    │   └── infra
+    └── frontend: main application
+        ├── core
+        └── ui
+            ├── components
+            └── screens
 ```
