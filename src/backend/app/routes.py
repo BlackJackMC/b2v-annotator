@@ -20,6 +20,10 @@ async def claim_task(task_id: str, request: ClaimTaskRequest):
 async def unclaim_task(task_id: str, request: UnclaimTaskRequest):
     return await TaskUseCase.unclaim_task(task_id, request.user_id)
 
+@router.post("/{task_id}/reclaim")
+async def reclaim_task(task_id: str, request: ClaimTaskRequest):
+    return await TaskUseCase.reclaim_task(task_id, request)
+
 @router.post("/{task_id}")
 async def submit_task(task_id: str, request: SubmitTaskRequest):
     return await TaskUseCase.submit_task(task_id, request)
