@@ -17,9 +17,9 @@ class APIClient:
         res = requests.post(f"{self.base_url}/tasks", json={"task_ids": task_ids})
         return res.json().get("tasks", []) if res.status_code == 200 else []
 
-    def claim_task(self, task_id: str, task_type: str) -> bool:
+    def claim_task(self, task_id: str, task_type: str) -> Dict:
         res = requests.post(f"{self.base_url}/tasks/{task_id}/claim", json={"user_id": self.user_id, "task_type": task_type})
-        return res.status_code == 200
+        return res.json() if res.status_code == 200 else None
 
     def submit_task(self, task_id: str, points: List[Dict]) -> bool:
         res = requests.post(f"{self.base_url}/tasks/{task_id}", json={"user_id": self.user_id, "result": {"points": points}})

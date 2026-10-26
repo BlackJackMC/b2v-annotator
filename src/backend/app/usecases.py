@@ -1,8 +1,8 @@
 from datetime import datetime, timedelta, timezone
 from pymongo.errors import DuplicateKeyError
+from pymongo import ReturnDocument
 from fastapi import HTTPException, status
 from typing import List
-from beanie import UpdateResponse
 from beanie.operators import In
 
 from backend.domain.models import AnnotationTask
@@ -15,7 +15,18 @@ class TaskUseCase:
         tasks = await AnnotationTask.find(
             In(AnnotationTask.task_id, task_ids)
         ).to_list()
-        return tasks
+        
+        now = datetime.now(timezone.utc)
+        timeout_threshold = now - timedelta(minutes=settings.LOCK_TIMEOUT_MINUTES)
+        
+        result = []
+        for t in tasks:
+            task_dict = t.model_dump()
+            if t.status == "processing" and t.locked_at and t.locked_at < timeout_threshold:
+                task_dict["status"] = "expired" 
+            result.append(task_dict)
+            
+        return result
 
     @staticmethod
     async def claim_task(task_id: str, request: ClaimTaskRequest):
@@ -35,38 +46,45 @@ class TaskUseCase:
         except DuplicateKeyError:
             timeout_threshold = now - timedelta(minutes=settings.LOCK_TIMEOUT_MINUTES)
             
-            updated_task = await AnnotationTask.find_one(
-                AnnotationTask.task_id == task_id,
-                AnnotationTask.status == "processing",
-                {"$or": [
-                    {"locked_at": {"$lt": timeout_threshold}},
-                    {"locked_by": request.user_id} 
-                ]}
-            ).update(
+            collection = AnnotationTask.get_motor_collection()
+            updated_doc = await collection.find_one_and_update(
+                {
+                    "task_id": task_id,
+                    "status": "processing",
+                    "$or": [
+                        {"locked_at": {"$lt": timeout_threshold}},
+                        {"locked_by": request.user_id} 
+                    ]
+                },
                 {"$set": {"locked_by": request.user_id, "locked_at": now}},
-                response_type=UpdateResponse.NEW_DOCUMENT
-            ) # type: ignore
+                return_document=ReturnDocument.AFTER
+            )
             
-            if not updated_task:
+            if not updated_doc:
                 raise HTTPException(
                     status_code=status.HTTP_409_CONFLICT,
                     detail="Task is currently locked by someone else or already done."
                 )
                 
-            return {"message": "Task claim stolen or resumed"}
+            return {
+                "message": "Task claim stolen or resumed",
+                "existing_result": updated_doc.get("result") 
+            }
 
     @staticmethod
     async def submit_task(task_id: str, request: SubmitTaskRequest):
-        task = await AnnotationTask.find_one(
-            AnnotationTask.task_id == task_id,
-            AnnotationTask.locked_by == request.user_id,
-            AnnotationTask.status == "processing"
-        ).update(
+        collection = AnnotationTask.get_motor_collection()
+        updated_doc = await collection.find_one_and_update(
+            {
+                "task_id": task_id,
+                "locked_by": request.user_id,
+                "status": "processing"
+            },
             {"$set": {"status": "done", "result": request.result, "locked_by": None, "locked_at": None}},
-            response_type=UpdateResponse.NEW_DOCUMENT
-        ) # type: ignore
+            return_document=ReturnDocument.AFTER
+        )
         
-        if not task:
+        if not updated_doc:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Task not found or lock expired."
@@ -77,15 +95,17 @@ class TaskUseCase:
     async def reclaim_task(task_id: str, request: ClaimTaskRequest):
         now = datetime.now(timezone.utc)
         
-        task = await AnnotationTask.find_one(
-            AnnotationTask.task_id == task_id,
-            AnnotationTask.status == "done"
-        ).update(
+        collection = AnnotationTask.get_motor_collection()
+        updated_doc = await collection.find_one_and_update(
+            {
+                "task_id": task_id,
+                "status": "done"
+            },
             {"$set": {"status": "processing", "locked_by": request.user_id, "locked_at": now}},
-            response_type=UpdateResponse.NEW_DOCUMENT
-        ) # type: ignore
+            return_document=ReturnDocument.AFTER
+        )
         
-        if not task:
+        if not updated_doc:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail="Task is not in 'done' state or is currently being edited by someone else."
@@ -93,7 +113,7 @@ class TaskUseCase:
             
         return {
             "message": "Task reclaimed for editing",
-            "existing_result": task.result 
+            "existing_result": updated_doc.get("result") 
         }
 
     @staticmethod

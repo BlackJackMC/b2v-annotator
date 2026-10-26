@@ -145,7 +145,10 @@ class OBBTaskScreen(QWidget):
             self.manual_refresh()
             return
         
-        if self.api.claim_task(task_id, "obb"):
+        claim_res = self.api.claim_task(task_id, "obb")
+        if claim_res:
+            if claim_res.get("existing_result"):
+                task_info["existing_result"] = claim_res.get("existing_result")
             self.set_current_task(task_info)
         else:
             QMessageBox.warning(self, "Error", "Cannot lock this task.")

@@ -73,9 +73,12 @@ class DataManager:
         free_tasks = [t for t in self.cached_tasks if t["task_id"] not in unavailable_ids and os.path.exists(t["image_path"])]
 
         for task in free_tasks:
-            if self.api.claim_task(task["task_id"], task_type):
+            claim_res = self.api.claim_task(task["task_id"], task_type)
+            if claim_res:
                 if task["task_id"] in existing_results:
                     task["existing_result"] = existing_results[task["task_id"]]
+                elif claim_res.get("existing_result"):
+                    task["existing_result"] = claim_res.get("existing_result")
                 return task
 
         return None
