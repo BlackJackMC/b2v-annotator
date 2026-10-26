@@ -51,19 +51,48 @@ class TaskUseCase:
             return {"message": "Task claim stolen (previous lock timed out)"}
 
     @staticmethod
+    async def reclaim_task(task_id: str, request: ClaimTaskRequest):
+        now = datetime.now(timezone.utc)
+        
+        task = await AnnotationTask.find_one(
+            AnnotationTask.task_id == task_id,
+            AnnotationTask.status == "done"
+        ).update(
+            {"$set": {"status": "processing", "locked_by": request.user_id, "locked_at": now}},
+            response_type=UpdateResponse.NEW_DOCUMENT
+        )
+        
+        if not task:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="Task is not in 'done' state or is currently being edited by someone else."
+            )
+            
+        return {
+            "message": "Task reclaimed for editing",
+            "existing_result": task.result
+        }
+
+    @staticmethod
     async def unclaim_task(task_id: str, user_id: str):
         task = await AnnotationTask.find_one(
             AnnotationTask.task_id == task_id,
             AnnotationTask.locked_by == user_id,
             AnnotationTask.status == "processing"
         )
+        
         if not task:
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND, 
                 detail="Task not found or you don't own the lock."
             )
-        await task.delete()
-        return {"message": "Task unclaimed and removed from DB"}
+            
+        if task.result:
+            await task.update({"$set": {"status": "done", "locked_by": None, "locked_at": None}})
+            return {"message": "Edit cancelled, task reverted to done"}
+        else:
+            await task.delete()
+            return {"message": "Task unclaimed and removed from DB"}
 
     @staticmethod
     async def submit_task(task_id: str, request: SubmitTaskRequest):
