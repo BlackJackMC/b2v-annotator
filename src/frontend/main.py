@@ -8,6 +8,7 @@ from ui.screens.task_select import TaskSelectScreen
 
 from tasks.obb.screen import OBBTaskScreen
 from tasks.aabb.screen import AABBTaskScreen
+from tasks.svg.screen import SVGTaskScreen
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -55,13 +56,18 @@ class MainWindow(QMainWindow):
                     return
                 config_dict[key] = folder
                 
-            self.data_manager.set_task_config(task_type, config_dict)
+            if task_type == "svg":
+                self.data_manager.task_configs[task_type] = config_dict
+            else:
+                self.data_manager.set_task_config(task_type, config_dict)
 
         if task_type not in self.workspace_screens:
             if task_type == "obb":
                 self.workspace_screens[task_type] = OBBTaskScreen(self.api, self.data_manager, self.goto_menu)
             elif task_type == "aabb":
                 self.workspace_screens[task_type] = AABBTaskScreen(self.api, self.data_manager, self.goto_menu)
+            elif task_type == "svg":
+                self.workspace_screens[task_type] = SVGTaskScreen(self.api, self.data_manager, self.goto_menu)
             
             if task_type in self.workspace_screens:
                 self.stacked_widget.addWidget(self.workspace_screens[task_type])
@@ -75,6 +81,8 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("Shortcuts: [Click] Add Point | [Esc] Reset | [Ctrl + S] Save & Next | [Middle/Right Drag] Pan")
             elif task_type == "aabb":
                 self.status_bar.showMessage("Shortcuts: [Left Drag] Draw Box | [Left Click] Select Box | [Left Drag on Edge] Move edge | [Delete] Delete selected | [Ctrl + S] Save & Next | [Middle Drag] Pan")
+            elif task_type == "svg":
+                self.status_bar.showMessage("[P] Freehand | [L] Polyline | [V] Edit | [Enter] Finish | [Ctrl+Z] Undo | [Ctrl+Shift+Z] Redo | [Ctrl+S] Save | [F] Fit | [Tab] View | [Middle/Right Drag] Pan")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
