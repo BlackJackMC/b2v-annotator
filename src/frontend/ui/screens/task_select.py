@@ -20,7 +20,12 @@ class TaskSelectScreen(QWidget):
         btn_obb.clicked.connect(lambda: self.on_task_selected("obb"))
         layout.addWidget(btn_obb, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        tasks_wip = ["Detect Content (AABB)", "Classify Content", "Trace SVG"]
+        btn_aabb = QPushButton("Detect Content (AABB)")
+        btn_aabb.setFixedSize(300, 50)
+        btn_aabb.clicked.connect(lambda: self.on_task_selected("aabb"))
+        layout.addWidget(btn_aabb, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        tasks_wip = ["Classify Content", "Trace SVG"]
         for name in tasks_wip:
             btn = QPushButton(name)
             btn.setFixedSize(300, 50)

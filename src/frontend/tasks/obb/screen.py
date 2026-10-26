@@ -12,6 +12,7 @@ class OBBTaskScreen(QWidget):
         self.data_manager = data_manager
         self.on_back_callback = on_back_callback
         self.current_task = None
+        self.task_type = "obb"
         
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self.sync_data_timer)
@@ -60,7 +61,7 @@ class OBBTaskScreen(QWidget):
         self.sync_timer.start(10000)
 
     def manual_refresh(self):
-        self.data_manager.scan_local_folder("obb")
+        self.data_manager.scan_local_folder(self.task_type)
         self.sync_data()
         
         if self.current_task is None:
@@ -71,14 +72,14 @@ class OBBTaskScreen(QWidget):
 
     def sync_data(self):
         self.history_list.clear()
-        done_tasks = self.data_manager.get_done_tasks("obb")
+        done_tasks = self.data_manager.get_done_tasks(self.task_type)
         for task in done_tasks:
             item = QListWidgetItem(task["task_id"])
             item.setData(Qt.ItemDataRole.UserRole, task)
             self.history_list.addItem(item)
             
         self.processing_list.clear()
-        processing_tasks = self.data_manager.get_processing_tasks("obb")
+        processing_tasks = self.data_manager.get_processing_tasks(self.task_type)
         for task in processing_tasks:
             item = QListWidgetItem(task["task_id"])
             item.setData(Qt.ItemDataRole.UserRole, task)
@@ -92,7 +93,7 @@ class OBBTaskScreen(QWidget):
             if self.current_task:
                 self.set_current_task(self.current_task)
         
-        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+        elif event.key() == Qt.Key.Key_S and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             coords = self.canvas.get_coordinates()
             if len(coords) == 4:
                 self.save_and_submit(coords)
@@ -121,7 +122,7 @@ class OBBTaskScreen(QWidget):
         self.load_next_task()
 
     def load_next_task(self):
-        task = self.data_manager.get_free_task(task_type="obb")
+        task = self.data_manager.get_free_task(task_type=self.task_type)
         self.set_current_task(task)
 
     def set_current_task(self, task):
@@ -145,7 +146,7 @@ class OBBTaskScreen(QWidget):
             self.manual_refresh()
             return
         
-        claim_res = self.api.claim_task(task_id, "obb")
+        claim_res = self.api.claim_task(task_id, self.task_type)
         if claim_res:
             if claim_res.get("existing_result"):
                 task_info["existing_result"] = claim_res.get("existing_result")

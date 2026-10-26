@@ -93,7 +93,7 @@ class AABBTaskScreen(QWidget):
             if self.current_task:
                 self.set_current_task(self.current_task)
         
-        elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
+        elif event.key() == Qt.Key.Key_S and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
             coords = self.canvas.get_coordinates()
             self.save_and_submit(coords)
 
@@ -127,11 +127,11 @@ class AABBTaskScreen(QWidget):
     def set_current_task(self, task):
         if task:
             self.current_task = task
-            self.canvas.load_image(task['image_path'])
+            self.canvas.load_image(task['image_path'], task.get('crop_coords'))
             
             existing_result = task.get("existing_result")
-            if existing_result:
-                self.canvas.load_existing_points(existing_result)
+            if existing_result and "points" in existing_result:
+                self.canvas.load_existing_points(existing_result["points"])
         else:
             self.current_task = None
             self.canvas.show_empty_state()

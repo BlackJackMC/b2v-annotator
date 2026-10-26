@@ -1,7 +1,7 @@
 from typing import List, Dict
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem
-from PyQt6.QtCore import Qt, QPoint
-from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter
+from PyQt6.QtCore import Qt, QPoint, QPointF
+from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter, QPolygonF, QPainterPath
 
 class BoundingBox(QGraphicsRectItem):
     def __init__(self, x, y, w, h, canvas):
@@ -10,14 +10,111 @@ class BoundingBox(QGraphicsRectItem):
         self.setPen(QPen(QColor("yellow"), 2))
         self.setBrush(QBrush(QColor(255, 255, 0, 40)))
         self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsSelectable)
-        self.setFlag(QGraphicsRectItem.GraphicsItemFlag.ItemIsMovable)
+        self.setAcceptHoverEvents(True)
+        
+        self.mode = "none"
+        self.edge = None
+        self.drag_start_pos = None
+        self.original_rect = None
+        self.original_item_pos = None
+
+    def get_edge_at(self, pos):
+        rect = self.rect()
+        margin = 8
+        x, y, w, h = rect.x(), rect.y(), rect.width(), rect.height()
+        
+        left = abs(pos.x() - x) <= margin
+        right = abs(pos.x() - (x + w)) <= margin
+        top = abs(pos.y() - y) <= margin
+        bottom = abs(pos.y() - (y + h)) <= margin
+        
+        inside_x = x + margin < pos.x() < x + w - margin
+        inside_y = y + margin < pos.y() < y + h - margin
+        
+        if top and left: return "top-left"
+        if top and right: return "top-right"
+        if bottom and left: return "bottom-left"
+        if bottom and right: return "bottom-right"
+        if top and inside_x: return "top"
+        if bottom and inside_x: return "bottom"
+        if left and inside_y: return "left"
+        if right and inside_y: return "right"
+        return None
+
+    def hoverMoveEvent(self, event):
+        edge = self.get_edge_at(event.pos())
+        if edge in ("top", "bottom"):
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif edge in ("left", "right"):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+        elif edge in ("top-left", "bottom-right"):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif edge in ("top-right", "bottom-left"):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        else:
+            self.setCursor(Qt.CursorShape.SizeAllCursor)
+        super().hoverMoveEvent(event)
 
     def mousePressEvent(self, event):
-        if event.button() == Qt.MouseButton.RightButton:
-            self.canvas.boxes.remove(self)
-            self.canvas.scene.removeItem(self)
+        if event.button() == Qt.MouseButton.LeftButton:
+            edge = self.get_edge_at(event.pos())
+            self.drag_start_pos = event.scenePos()
+            self.original_rect = self.rect()
+            self.original_item_pos = self.pos()
+            
+            if edge:
+                self.mode = "resizing"
+                self.edge = edge
+            else:
+                self.mode = "moving"
+            event.accept()
             return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self.mode == "moving":
+            delta = event.scenePos() - self.drag_start_pos
+            self.setPos(self.original_item_pos + delta)
+            event.accept()
+            return
+            
+        elif self.mode == "resizing":
+            delta = event.scenePos() - self.drag_start_pos
+            r = self.original_rect
+            x, y, w, h = r.x(), r.y(), r.width(), r.height()
+            
+            dx = delta.x()
+            dy = delta.y()
+            
+            if "left" in self.edge:
+                new_w = w - dx
+                if new_w > 10:
+                    x += dx
+                    w = new_w
+            if "right" in self.edge:
+                new_w = w + dx
+                if new_w > 10:
+                    w = new_w
+            if "top" in self.edge:
+                new_h = h - dy
+                if new_h > 10:
+                    y += dy
+                    h = new_h
+            if "bottom" in self.edge:
+                new_h = h + dy
+                if new_h > 10:
+                    h = new_h
+                    
+            self.setRect(x, y, w, h)
+            event.accept()
+            return
+            
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self.mode = "none"
+        self.edge = None
+        super().mouseReleaseEvent(event)
 
 class ImageCanvas(QGraphicsView):
     def __init__(self):
@@ -27,6 +124,8 @@ class ImageCanvas(QGraphicsView):
         self.boxes = []
         self.image_item = None
         self.is_editable = False
+        self.crop_offset_x = 0
+        self.crop_offset_y = 0
         
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -41,16 +140,14 @@ class ImageCanvas(QGraphicsView):
         self._draw_start_pos = None
 
     def wheelEvent(self, event):
-        if not self.is_editable:
-            return
+        if not self.is_editable: return
         zoom_in_factor = 1.15
         zoom_out_factor = 1 / zoom_in_factor
         zoom_factor = zoom_in_factor if event.angleDelta().y() > 0 else zoom_out_factor
         self.scale(zoom_factor, zoom_factor)
 
     def mousePressEvent(self, event):
-        if not self.is_editable:
-            return
+        if not self.is_editable: return
 
         if event.button() == Qt.MouseButton.MiddleButton:
             self._is_panning = True
@@ -123,30 +220,68 @@ class ImageCanvas(QGraphicsView):
 
         super().mouseReleaseEvent(event)
 
+    def keyPressEvent(self, event):
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            selected_items = self.scene.selectedItems()
+            for item in selected_items:
+                if isinstance(item, BoundingBox):
+                    self.boxes.remove(item)
+                    self.scene.removeItem(item)
+            return
+        super().keyPressEvent(event)
+
     def show_empty_state(self):
         self.scene.clear()
         self.boxes.clear()
         self.is_editable = False
+        self.crop_offset_x = 0
+        self.crop_offset_y = 0
         self.resetTransform()
         
         text_item = QGraphicsTextItem("No more images available")
         text_item.setFont(QFont("Arial", 24, QFont.Weight.Bold))
         text_item.setDefaultTextColor(QColor("gray"))
-        
         text_rect = text_item.boundingRect()
         text_item.setPos(-text_rect.width() / 2, -text_rect.height() / 2)
         self.scene.addItem(text_item)
         self.setSceneRect(text_item.boundingRect())
 
-    def load_image(self, image_path):
+    def load_image(self, image_path, crop_coords=None):
         self.scene.clear()
         self.boxes.clear()
         self.is_editable = True
         self.resetTransform()
+        self.crop_offset_x = 0
+        self.crop_offset_y = 0
         
         pixmap = QPixmap(image_path)
-        self.image_item = self.scene.addPixmap(pixmap)
         
+        if crop_coords and len(crop_coords) == 4:
+            points = [QPointF(p["x"], p["y"]) for p in crop_coords]
+            polygon = QPolygonF(points)
+            
+            path = QPainterPath()
+            path.addPolygon(polygon)
+            
+            masked_pixmap = QPixmap(pixmap.size())
+            masked_pixmap.fill(Qt.GlobalColor.transparent)
+            
+            painter = QPainter(masked_pixmap)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+            painter.setClipPath(path)
+            painter.drawPixmap(0, 0, pixmap)
+            painter.end()
+            
+            bounding_rect = polygon.boundingRect().toRect() 
+            image_rect = pixmap.rect()
+            intersected_rect = bounding_rect.intersected(image_rect)
+            
+            self.crop_offset_x = intersected_rect.x()
+            self.crop_offset_y = intersected_rect.y()
+            
+            pixmap = masked_pixmap.copy(intersected_rect)
+
+        self.image_item = self.scene.addPixmap(pixmap)
         margin = max(pixmap.width(), pixmap.height())
         self.setSceneRect(-margin, -margin, pixmap.width() + 2 * margin, pixmap.height() + 2 * margin)
         self.centerOn(self.image_item)
@@ -157,7 +292,7 @@ class ImageCanvas(QGraphicsView):
         self.boxes.clear()
         
         for b_data in points_data:
-            box = BoundingBox(b_data["x"], b_data["y"], b_data["w"], b_data["h"], self)
+            box = BoundingBox(b_data["x"] - self.crop_offset_x, b_data["y"] - self.crop_offset_y, b_data["w"], b_data["h"], self)
             self.scene.addItem(box)
             self.boxes.append(box)
 
@@ -167,8 +302,8 @@ class ImageCanvas(QGraphicsView):
             rect = box.rect()
             pos = box.pos()
             result.append({
-                "x": rect.x() + pos.x(),
-                "y": rect.y() + pos.y(),
+                "x": rect.x() + pos.x() + self.crop_offset_x,
+                "y": rect.y() + pos.y() + self.crop_offset_y,
                 "w": rect.width(),
                 "h": rect.height()
             })

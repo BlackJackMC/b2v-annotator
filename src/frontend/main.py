@@ -21,6 +21,8 @@ class MainWindow(QMainWindow):
         self.stacked_widget = QStackedWidget()
         self.setCentralWidget(self.stacked_widget)
 
+        self.status_bar = self.statusBar()
+
         self.login_screen = LoginScreen(self.goto_task_select)
         self.task_select_screen = TaskSelectScreen(self.goto_workspace)
         self.workspace_screens = {}
@@ -32,9 +34,11 @@ class MainWindow(QMainWindow):
 
     def goto_task_select(self, username):
         self.api.set_user(username)
+        self.status_bar.clearMessage()
         self.stacked_widget.setCurrentWidget(self.task_select_screen)
 
     def goto_menu(self):
+        self.status_bar.clearMessage()
         self.stacked_widget.setCurrentWidget(self.task_select_screen)
 
     def goto_workspace(self, task_type):
@@ -66,6 +70,11 @@ class MainWindow(QMainWindow):
             screen = self.workspace_screens[task_type]
             screen.start_task()
             self.stacked_widget.setCurrentWidget(screen)
+            
+            if task_type == "obb":
+                self.status_bar.showMessage("Shortcuts: [Click] Add Point | [Esc] Reset | [Ctrl + S] Save & Next | [Middle/Right Drag] Pan")
+            elif task_type == "aabb":
+                self.status_bar.showMessage("Shortcuts: [Left Drag] Draw Box | [Left Click] Select Box | [Left Drag on Edge] Move edge | [Delete] Delete selected | [Ctrl + S] Save & Next | [Middle Drag] Pan")
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

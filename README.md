@@ -4,7 +4,6 @@ A tool to annotate ground-truth for Board2vec. Backend made by me and frontend m
 ## Folder structure
 ```
 .
-.
 ├── data: input data
 │   ├── keyframes
 │   └── obb
