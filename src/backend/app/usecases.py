@@ -22,8 +22,12 @@ class TaskUseCase:
         result = []
         for t in tasks:
             task_dict = t.model_dump()
-            if t.status == "processing" and t.locked_at and t.locked_at < timeout_threshold:
-                task_dict["status"] = "expired" 
+            if t.status == "processing" and t.locked_at:
+                locked_at = t.locked_at
+                if locked_at.tzinfo is None:
+                    locked_at = locked_at.replace(tzinfo=timezone.utc)
+                if locked_at < timeout_threshold:
+                    task_dict["status"] = "expired" 
             result.append(task_dict)
             
         return result
