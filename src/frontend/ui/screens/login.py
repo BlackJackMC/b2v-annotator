@@ -13,7 +13,7 @@ class LoginScreen(QWidget):
 
         title = QLabel("Board2Vec Annotator")
         title.setStyleSheet("font-size: 24px; font-weight: bold; margin-bottom: 20px;")
-        
+
         self.username_input = QLineEdit()
         self.username_input.setPlaceholderText("Enter Username...")
         self.username_input.setFixedWidth(400)

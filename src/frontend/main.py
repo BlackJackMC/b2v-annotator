@@ -1,4 +1,5 @@
 import sys
+from pathlib import Path
 from PyQt6.QtWidgets import QApplication, QMainWindow, QStackedWidget, QFileDialog
 from core.api_client import APIClient
 from core.data_manager import DataManager
@@ -57,7 +58,16 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    
+    qss_path = Path(__file__).resolve().parent / "ui" / "styles.qss"
+    if qss_path.exists():
+        print(f"Loaded stylesheet: {qss_path}")
+        with open(qss_path, "r", encoding="utf-8") as f:
+            app.setStyleSheet(f.read())
+    else:
+        print(f"QSS file not found at {qss_path}, using default theme.")
+        app.setStyle("Fusion")
+        
     window = MainWindow()
     window.show()
     sys.exit(app.exec())

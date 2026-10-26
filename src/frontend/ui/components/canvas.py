@@ -1,7 +1,7 @@
 from typing import List, Dict
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsTextItem
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont
+from PyQt6.QtCore import Qt, QPoint, QPointF
+from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter
 
 class DraggablePoint(QGraphicsEllipseItem):
     def __init__(self, x, y, canvas, is_first=False):
@@ -14,14 +14,23 @@ class DraggablePoint(QGraphicsEllipseItem):
         self.is_first = is_first
 
     def itemChange(self, change, value):
+        if change == QGraphicsEllipseItem.GraphicsItemChange.ItemPositionChange:
+            if self.canvas.image_item:
+                rect = self.canvas.image_item.boundingRect()
+                x = max(0.0, min(value.x(), rect.width()))
+                y = max(0.0, min(value.y(), rect.height()))
+                return QPointF(x, y)
+                
         if change == QGraphicsEllipseItem.GraphicsItemChange.ItemPositionHasChanged:
             self.canvas.update_lines()
+            
         return super().itemChange(change, value)
 
     def mousePressEvent(self, event):
         if self.is_first and len(self.canvas.points) == 4 and not self.canvas.is_closed:
             self.canvas.close_polygon()
         super().mousePressEvent(event)
+
 
 class ImageCanvas(QGraphicsView):
     def __init__(self):
@@ -33,6 +42,78 @@ class ImageCanvas(QGraphicsView):
         self.is_closed = False
         self.image_item = None
         self.is_editable = False
+        
+        self.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        
+        self._is_panning = False
+        self._pan_start = QPoint()
+
+    def wheelEvent(self, event):
+        if not self.is_editable:
+            return
+        
+        zoom_in_factor = 1.15
+        zoom_out_factor = 1 / zoom_in_factor
+
+        if event.angleDelta().y() > 0:
+            zoom_factor = zoom_in_factor
+        else:
+            zoom_factor = zoom_out_factor
+
+        self.scale(zoom_factor, zoom_factor)
+
+    def mouseMoveEvent(self, event):
+        if self._is_panning:
+            delta = event.pos() - self._pan_start
+            self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - delta.x())
+            self.verticalScrollBar().setValue(self.verticalScrollBar().value() - delta.y())
+            self._pan_start = event.pos()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if self._is_panning:
+            self._is_panning = False
+            self.setCursor(Qt.CursorShape.ArrowCursor)
+            return
+        super().mouseReleaseEvent(event)
+
+    def mousePressEvent(self, event):
+        if not self.is_editable:
+            return
+
+        if event.button() == Qt.MouseButton.RightButton or event.button() == Qt.MouseButton.MiddleButton:
+            self._is_panning = True
+            self._pan_start = event.pos()
+            self.setCursor(Qt.CursorShape.ClosedHandCursor)
+            return
+
+        if self.is_closed:
+            super().mousePressEvent(event)
+            return
+
+        item = self.itemAt(event.pos())
+        if item == self.image_item or item is None:
+            scene_pos = self.mapToScene(event.pos())
+            x, y = scene_pos.x(), scene_pos.y()
+            
+            if self.image_item:
+                rect = self.image_item.boundingRect()
+                x = max(0.0, min(x, rect.width()))
+                y = max(0.0, min(y, rect.height()))
+
+            is_first = len(self.points) == 0
+            
+            if len(self.points) < 4:
+                pt = DraggablePoint(x, y, self, is_first)
+                self.scene.addItem(pt)
+                self.points.append(pt)
+                self.update_lines()
+        
+        super().mousePressEvent(event)
 
     def show_empty_state(self):
         self.scene.clear()
@@ -40,11 +121,16 @@ class ImageCanvas(QGraphicsView):
         self.lines.clear()
         self.is_closed = False
         self.is_editable = False
+        self.resetTransform()
         
         text_item = QGraphicsTextItem("No more images available")
         text_item.setFont(QFont("Arial", 24, QFont.Weight.Bold))
         text_item.setDefaultTextColor(QColor("gray"))
+        
+        text_rect = text_item.boundingRect()
+        text_item.setPos(-text_rect.width() / 2, -text_rect.height() / 2)
         self.scene.addItem(text_item)
+        self.setSceneRect(text_item.boundingRect())
 
     def load_image(self, image_path):
         self.scene.clear()
@@ -52,10 +138,15 @@ class ImageCanvas(QGraphicsView):
         self.lines.clear()
         self.is_closed = False
         self.is_editable = True
+        self.resetTransform()
         
         pixmap = QPixmap(image_path)
         self.image_item = self.scene.addPixmap(pixmap)
-        self.setSceneRect(0, 0, pixmap.width(), pixmap.height())
+        
+        margin = max(pixmap.width(), pixmap.height())
+        self.setSceneRect(-margin, -margin, pixmap.width() + 2 * margin, pixmap.height() + 2 * margin)
+        
+        self.centerOn(self.image_item)
 
     def load_existing_points(self, points_data: List[Dict]):
         for pt in self.points:
@@ -70,27 +161,6 @@ class ImageCanvas(QGraphicsView):
         
         self.is_closed = True
         self.update_lines()
-
-    def mousePressEvent(self, event):
-        if not self.is_editable:
-            return
-
-        if self.is_closed:
-            super().mousePressEvent(event)
-            return
-
-        item = self.itemAt(event.pos())
-        if item == self.image_item or item is None:
-            scene_pos = self.mapToScene(event.pos())
-            is_first = len(self.points) == 0
-            
-            if len(self.points) < 4:
-                pt = DraggablePoint(scene_pos.x(), scene_pos.y(), self, is_first)
-                self.scene.addItem(pt)
-                self.points.append(pt)
-                self.update_lines()
-        
-        super().mousePressEvent(event)
 
     def update_lines(self):
         for line in self.lines:
