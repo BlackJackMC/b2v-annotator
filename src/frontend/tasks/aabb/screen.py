@@ -3,15 +3,16 @@ from typing import List, Dict
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QPushButton, QMessageBox, QListWidgetItem, QLabel
 from PyQt6.QtCore import Qt, QTimer
 from core.api_client import APIClient
-from ui.components.canvas import ImageCanvas
+from tasks.aabb.canvas import ImageCanvas
 
-class OBBTaskScreen(QWidget):
+class AABBTaskScreen(QWidget):
     def __init__(self, api_client: APIClient, data_manager, on_back_callback):
         super().__init__()
         self.api = api_client
         self.data_manager = data_manager
         self.on_back_callback = on_back_callback
         self.current_task = None
+        self.task_type = "aabb"
         
         self.sync_timer = QTimer(self)
         self.sync_timer.timeout.connect(self.sync_data_timer)
@@ -60,7 +61,7 @@ class OBBTaskScreen(QWidget):
         self.sync_timer.start(10000)
 
     def manual_refresh(self):
-        self.data_manager.scan_local_folder("obb")
+        self.data_manager.scan_local_folder(self.task_type)
         self.sync_data()
         
         if self.current_task is None:
@@ -71,14 +72,14 @@ class OBBTaskScreen(QWidget):
 
     def sync_data(self):
         self.history_list.clear()
-        done_tasks = self.data_manager.get_done_tasks("obb")
+        done_tasks = self.data_manager.get_done_tasks(self.task_type)
         for task in done_tasks:
             item = QListWidgetItem(task["task_id"])
             item.setData(Qt.ItemDataRole.UserRole, task)
             self.history_list.addItem(item)
             
         self.processing_list.clear()
-        processing_tasks = self.data_manager.get_processing_tasks("obb")
+        processing_tasks = self.data_manager.get_processing_tasks(self.task_type)
         for task in processing_tasks:
             item = QListWidgetItem(task["task_id"])
             item.setData(Qt.ItemDataRole.UserRole, task)
@@ -94,8 +95,7 @@ class OBBTaskScreen(QWidget):
         
         elif event.key() == Qt.Key.Key_Return or event.key() == Qt.Key.Key_Enter:
             coords = self.canvas.get_coordinates()
-            if len(coords) == 4:
-                self.save_and_submit(coords)
+            self.save_and_submit(coords)
 
     def save_and_submit(self, coords):
         if not self.current_task:
@@ -114,14 +114,14 @@ class OBBTaskScreen(QWidget):
         
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
         with open(output_path, 'w') as f:
-            json.dump({"board_obb": coords}, f)
+            json.dump({"boxes": coords}, f)
         
         self.api.submit_task(task_id, coords)
         self.sync_data()
         self.load_next_task()
 
     def load_next_task(self):
-        task = self.data_manager.get_free_task(task_type="obb")
+        task = self.data_manager.get_free_task(self.task_type)
         self.set_current_task(task)
 
     def set_current_task(self, task):
@@ -130,8 +130,8 @@ class OBBTaskScreen(QWidget):
             self.canvas.load_image(task['image_path'])
             
             existing_result = task.get("existing_result")
-            if existing_result and "points" in existing_result:
-                self.canvas.load_existing_points(existing_result["points"])
+            if existing_result:
+                self.canvas.load_existing_points(existing_result)
         else:
             self.current_task = None
             self.canvas.show_empty_state()
@@ -145,7 +145,7 @@ class OBBTaskScreen(QWidget):
             self.manual_refresh()
             return
         
-        claim_res = self.api.claim_task(task_id, "obb")
+        claim_res = self.api.claim_task(task_id, self.task_type)
         if claim_res:
             if claim_res.get("existing_result"):
                 task_info["existing_result"] = claim_res.get("existing_result")

@@ -5,7 +5,9 @@ from core.api_client import APIClient
 from core.data_manager import DataManager
 from ui.screens.login import LoginScreen
 from ui.screens.task_select import TaskSelectScreen
-from ui.screens.obb_task import OBBTaskScreen
+
+from tasks.obb.screen import OBBTaskScreen
+from tasks.aabb.screen import AABBTaskScreen
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -37,24 +39,33 @@ class MainWindow(QMainWindow):
 
     def goto_workspace(self, task_type):
         if task_type not in self.data_manager.task_configs:
-            input_dir = QFileDialog.getExistingDirectory(self, f"Select Input Folder for {task_type.upper()}")
-            if not input_dir:
-                return
-            
-            output_dir = QFileDialog.getExistingDirectory(self, f"Select Output Folder for {task_type.upper()}")
-            if not output_dir:
+            required_folders = self.data_manager.get_required_folders(task_type)
+            if not required_folders:
+                print(f"No strategy defined for {task_type}")
                 return
                 
-            self.data_manager.set_task_config(task_type, input_dir, output_dir)
+            config_dict = {}
+            for key, display_name in required_folders.items():
+                folder = QFileDialog.getExistingDirectory(self, f"Select {display_name} for {task_type.upper()}")
+                if not folder:
+                    return
+                config_dict[key] = folder
+                
+            self.data_manager.set_task_config(task_type, config_dict)
 
         if task_type not in self.workspace_screens:
             if task_type == "obb":
                 self.workspace_screens[task_type] = OBBTaskScreen(self.api, self.data_manager, self.goto_menu)
+            elif task_type == "aabb":
+                self.workspace_screens[task_type] = AABBTaskScreen(self.api, self.data_manager, self.goto_menu)
+            
+            if task_type in self.workspace_screens:
                 self.stacked_widget.addWidget(self.workspace_screens[task_type])
         
-        screen = self.workspace_screens[task_type]
-        screen.start_task()
-        self.stacked_widget.setCurrentWidget(screen)
+        if task_type in self.workspace_screens:
+            screen = self.workspace_screens[task_type]
+            screen.start_task()
+            self.stacked_widget.setCurrentWidget(screen)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
