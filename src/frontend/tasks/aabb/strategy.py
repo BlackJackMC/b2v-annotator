@@ -23,21 +23,27 @@ class AABBStrategy(TaskStrategy):
         for json_file in obb_dir.rglob("*.json"):
             video_name = json_file.parent.name
             frame = json_file.stem
-            
-            img_path = keyframes_dir / video_name / f"{frame}.png"
-            if not img_path.exists():
+            img_path = next(
+                (
+                    path
+                    for ext in (".png", ".jpg", ".jpeg")
+                    if (path := keyframes_dir / video_name / f"{frame}{ext}").is_file()
+                ),
+                None
+            )
+
+            if img_path is None:
                 continue
-                
             try:
-                with open(json_file, 'r') as f:
+                with open(json_file, "r") as f:
                     data = json.load(f)
-                    
+
                 obb_coords = data.get("board_obb")
                 if not obb_coords or len(obb_coords) != 4:
                     continue
 
                 task_id = f"{video_name}_{frame}_{self.task_type}"
-                
+
                 local_tasks.append({
                     "task_id": task_id,
                     "video_name": video_name,
