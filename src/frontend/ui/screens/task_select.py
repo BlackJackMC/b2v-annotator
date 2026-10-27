@@ -1,4 +1,4 @@
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel, QMessageBox
+from PyQt6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QLabel
 from PyQt6.QtCore import Qt
 
 class TaskSelectScreen(QWidget):
@@ -25,12 +25,12 @@ class TaskSelectScreen(QWidget):
         btn_aabb.clicked.connect(lambda: self.on_task_selected("aabb"))
         layout.addWidget(btn_aabb, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        tasks_wip = ["Classify Content", "Trace SVG"]
-        for name in tasks_wip:
-            btn = QPushButton(name)
-            btn.setFixedSize(300, 50)
-            btn.clicked.connect(self.show_wip_message)
-            layout.addWidget(btn, alignment=Qt.AlignmentFlag.AlignCenter)
+        btn_svg = QPushButton("Trace SVG")
+        btn_svg.setFixedSize(300, 50)
+        btn_svg.clicked.connect(lambda: self.on_task_selected("svg"))
+        layout.addWidget(btn_svg, alignment=Qt.AlignmentFlag.AlignCenter)
 
-    def show_wip_message(self):
-        QMessageBox.information(self, "Info", "This feature is currently under development.")
+        btn_classify = QPushButton("Classify Content")
+        btn_classify.setFixedSize(300, 50)
+        btn_classify.clicked.connect(lambda: self.on_task_selected("classify"))
+        layout.addWidget(btn_classify, alignment=Qt.AlignmentFlag.AlignCenter)

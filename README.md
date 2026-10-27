@@ -1,7 +1,9 @@
 # b2v-annotator
+
 A tool to annotate ground-truth for Board2vec. Backend made by me and frontend made by Gemini
 
 ## Folder structure
+
 ```
 .
 ├── data: input data

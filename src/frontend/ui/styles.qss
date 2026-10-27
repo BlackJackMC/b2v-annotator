@@ -64,3 +64,42 @@ QGraphicsView {
     background-color: #1e1e1e;
     border: 1px solid #3c3c3c;
 }
+
+QPushButton#handwritingButton, QPushButton#sketchButton {
+    font-size: 18px;
+    border-radius: 8px;
+    border: 3px solid transparent;
+    padding: 18px;
+}
+
+QPushButton#handwritingButton {
+    background-color: #094771;
+    border-color: #2579b0;
+}
+
+QPushButton#handwritingButton:hover, QPushButton#handwritingButton:checked {
+    background-color: #0e639c;
+}
+
+QPushButton#sketchButton {
+    background-color: #50335f;
+    border-color: #9661ab;
+}
+
+QPushButton#sketchButton:hover, QPushButton#sketchButton:checked {
+    background-color: #70448a;
+}
+
+QPushButton#handwritingButton:checked, QPushButton#sketchButton:checked {
+    border: 3px solid #ffffff;
+}
+
+QPushButton#handwritingButton:focus, QPushButton#sketchButton:focus {
+    border-style: dashed;
+}
+
+QPushButton#handwritingButton:disabled, QPushButton#sketchButton:disabled {
+    background-color: #343438;
+    color: #909094;
+    border-color: #4a4a50;
+}
