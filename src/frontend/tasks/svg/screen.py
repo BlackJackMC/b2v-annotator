@@ -106,10 +106,6 @@ class SVGTaskScreen(QWidget):
         right.addWidget(self.stroke_list)
         self.count_label = QLabel("0 strokes")
         right.addWidget(self.count_label)
-        self.review = QComboBox()
-        for label, value in [("Accepted", "accepted"),
-                             ("Uncertain / occluded", "uncertain"), ("Empty", "empty")]:
-            self.review.addItem(label, value)
         self.save_button = QPushButton("Save && Next (Ctrl+S)")
         self.save_button.clicked.connect(self.save_and_submit)
         self.next_button = QPushButton("Next available region")
@@ -125,8 +121,6 @@ class SVGTaskScreen(QWidget):
         sidebar_layout = QVBoxLayout(sidebar)
         sidebar_layout.setContentsMargins(0, 0, 0, 0)
         sidebar_layout.addWidget(scroll, stretch=1)
-        sidebar_layout.addWidget(QLabel("Overlay review"))
-        sidebar_layout.addWidget(self.review)
         sidebar_layout.addWidget(self.save_button)
         sidebar_layout.addWidget(self.next_button)
         layout.addWidget(sidebar, stretch=1)
@@ -142,7 +136,6 @@ class SVGTaskScreen(QWidget):
         self.canvas.strokes_changed.connect(self.on_strokes_changed)
         self.canvas.selection_changed.connect(self.on_selection_changed)
         self.canvas.message.connect(self.status_label.setText)
-        self.review.currentIndexChanged.connect(self.mark_dirty)
 
     def init_shortcuts(self):
         for key, callback, target in [
@@ -207,8 +200,6 @@ class SVGTaskScreen(QWidget):
         points = sum(len(stroke["points"]) for stroke in self.canvas.strokes)
         self.count_label.setText(f"{len(self.canvas.strokes)} strokes · {points} nodes")
         if not self.loading and self.document:
-            if self.review.currentData() == "empty" and self.canvas.strokes:
-                self.review.setCurrentIndex(0)
             self.mark_dirty()
 
     def mark_dirty(self, *args):
@@ -225,7 +216,6 @@ class SVGTaskScreen(QWidget):
              "points": copy.deepcopy(stroke["points"])}
             for stroke in self.canvas.strokes
         ]
-        document["review"] = self.review.currentData()
         return document
 
     def run_job(self, function, callback, message, block=False, quiet=False):
@@ -256,8 +246,7 @@ class SVGTaskScreen(QWidget):
             widget.setEnabled(not busy)
         if block:
             for widget in (self.canvas, self.tool_combo, self.undo_button, self.redo_button,
-                           self.delete_button, self.simplify_button, self.stroke_list,
-                           self.review):
+                           self.delete_button, self.simplify_button, self.stroke_list):
                 widget.setEnabled(not busy)
             for shortcut in self.shortcuts:
                 shortcut.setEnabled(not busy)
@@ -308,9 +297,8 @@ class SVGTaskScreen(QWidget):
                 self.canvas.load_image(self.crop_image, canvas_strokes(self.document))
                 self.context_label.setPixmap(QPixmap.fromImage(result["preview"]))
                 self.region_label.setText(self.current_task["label"])
-                self.review.setCurrentIndex(self.review.findData(self.document["review"]))
                 self.update_regions()
-                self.status_label.setText(result["warning"] or "Trace each visible stroke centerline, then review the overlay.")
+                self.status_label.setText(result["warning"] or "Trace each visible stroke centerline, then save the region.")
                 self.canvas.setFocus()
             else:
                 self.current_task = None
@@ -354,10 +342,10 @@ class SVGTaskScreen(QWidget):
         try:
             validate_annotation(document, self.current_task, complete=True)
         except (ValueError, KeyError, TypeError) as error:
-            QMessageBox.warning(self, "Review tracing", str(error))
+            QMessageBox.warning(self, "Tracing", str(error))
             return
         if self.crop_image is None:
-            QMessageBox.warning(self, "Review tracing", "No crop image is loaded.")
+            QMessageBox.warning(self, "Tracing", "No crop image is loaded.")
             return
         task, image = self.current_task, self.crop_image.copy()
 

@@ -2,7 +2,7 @@ import copy
 import json
 import math
 import os
-import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -15,7 +15,6 @@ def new_annotation(task, user_id):
         "region": task["source"]["region_index"] + 1,
         "crop": list(task["source"]["crop_xywh"]),
         "annotator": user_id,
-        "review": "accepted",
         "strokes": []
     }
 
@@ -25,12 +24,8 @@ def compact_annotation(data, task, user_id):
     if data.get("schema_version") == "board2vec.trace.v1":
         if data.get("task_id") != task["task_id"] or data["source"]["crop_xywh"] != result["crop"]:
             raise ValueError("This tracing belongs to a different image or region.")
-        result["review"] = data["annotation"].get("review", "accepted")
-        if result["review"] == "needs_review":
-            result["review"] = "accepted"
     else:
         validate_annotation(data, task)
-        result["review"] = data["review"]
     for stroke in data["strokes"]:
         tool = stroke["tool"]
         result["strokes"].append({
@@ -64,8 +59,6 @@ def validate_annotation(data, task=None, complete=False):
     if task and (data["task_id"] != task["task_id"] or crop != task["source"]["crop_xywh"] or
                  data["image"] != task["source"]["image"] or data["region"] != task["source"]["region_index"] + 1):
         raise ValueError("This tracing belongs to a different image or region.")
-    if data.get("review") not in ("accepted", "uncertain", "empty"):
-        raise ValueError("Unknown review status.")
     if not isinstance(data.get("strokes"), list):
         raise ValueError("Expected a strokes list.")
     for stroke in data["strokes"]:
@@ -79,10 +72,6 @@ def validate_annotation(data, task=None, complete=False):
                 raise ValueError("Stroke coordinates must be finite x/y pairs.")
             if not (0 <= point[0] <= crop[2] and 0 <= point[1] <= crop[3]):
                 raise ValueError("A stroke is outside the crop.")
-    if complete and not data["strokes"] and data["review"] != "empty":
-        raise ValueError("Trace the region, or explicitly mark it Empty.")
-    if complete and data["review"] == "empty" and data["strokes"]:
-        raise ValueError("An Empty region cannot contain strokes.")
     if len(json.dumps(data, allow_nan=False).encode("utf-8")) > 8 * 1024 * 1024:
         raise ValueError("This annotation exceeds 8 MB. Use smaller AABB regions.")
 
@@ -115,16 +104,15 @@ def svg_text(data):
 def atomic_write(path, content):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = None
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, delete=False) as stream:
-            temporary = stream.name
+        with temporary.open("wb") as stream:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
         os.replace(temporary, path)
     finally:
-        if temporary and os.path.exists(temporary):
+        if os.path.exists(temporary):
             os.unlink(temporary)
 
 

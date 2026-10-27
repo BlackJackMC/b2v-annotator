@@ -5,6 +5,7 @@ from core.api_client import APIClient
 from tasks.obb.strategy import OBBStrategy
 from tasks.aabb.strategy import AABBStrategy
 from tasks.svg.strategy import SVGStrategy
+from tasks.classify.strategy import ClassifyStrategy
 
 class DataManager:
     def __init__(self, api_client: APIClient):
@@ -15,7 +16,8 @@ class DataManager:
         self.strategies = {
             "obb": OBBStrategy("obb"),
             "aabb": AABBStrategy("aabb"),
-            "svg": SVGStrategy("svg")
+            "svg": SVGStrategy("svg"),
+            "classify": ClassifyStrategy("classify")
         }
 
     def get_required_folders(self, task_type: str) -> Dict[str, str]:
