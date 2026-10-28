@@ -22,6 +22,25 @@ QPushButton:pressed {
     background-color: #094771;
 }
 
+QPushButton#saveButton {
+    background-color: #237a46;
+    border: 1px solid #4cb875;
+}
+
+QPushButton#saveButton:hover {
+    background-color: #2d9457;
+}
+
+QPushButton#saveButton:pressed {
+    background-color: #195d34;
+}
+
+QPushButton#saveButton:disabled {
+    background-color: #304a3b;
+    color: #a6b6ac;
+    border-color: #486151;
+}
+
 QLineEdit {
     background-color: #3c3c3c;
     border: 1px solid #555555;

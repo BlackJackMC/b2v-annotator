@@ -1,6 +1,4 @@
 import json
-import os
-import uuid
 from pathlib import Path
 import requests
 from PyQt6.QtCore import Qt, QTimer, QEvent
@@ -8,6 +6,7 @@ from PyQt6.QtGui import QImage, QPainter, QPen, QColor, QPixmap, QKeySequence, Q
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QMessageBox
 from core.api_client import APIClient
 from tasks.classify.canvas import ImageCanvas
+from tasks.svg.document import atomic_write
 
 
 class ClassifyTaskScreen(QWidget):
@@ -52,6 +51,7 @@ class ClassifyTaskScreen(QWidget):
             button.setCheckable(True)
             button.setMinimumHeight(150)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
+            button.setToolTip("1 / H" if label == "handwriting" else "2 / K")
             button.clicked.connect(lambda checked, value=label: self.choose_label(value))
             self.label_buttons[label] = button
             choices.addWidget(button, stretch=1)
@@ -88,12 +88,16 @@ class ClassifyTaskScreen(QWidget):
         self.errors_button.hide()
         right.addWidget(self.errors_button)
         fit_button = QPushButton("Fit image (F)")
+        fit_button.setToolTip("Fit image (F)")
         fit_button.clicked.connect(self.canvas.fit_image)
         right.addWidget(fit_button)
         self.clear_button = QPushButton("Clear choice (Esc)")
+        self.clear_button.setToolTip("Clear choice (Esc); Undo (Ctrl+Z) restores it.")
         self.clear_button.clicked.connect(lambda: self.choose_label(None))
         right.addWidget(self.clear_button)
         self.save_button = QPushButton("Save && Next (Ctrl+S)")
+        self.save_button.setObjectName("saveButton")
+        self.save_button.setToolTip("Save and open the next region (Ctrl+S)")
         self.save_button.clicked.connect(self.save_and_submit)
         self.save_button.setMinimumHeight(52)
         right.addWidget(self.save_button)
@@ -140,6 +144,9 @@ class ClassifyTaskScreen(QWidget):
         self.sync_timer.start(30000)
 
     def stop_and_back(self):
+        if self.export_pending is not None:
+            self.status_label.setText("Retry Ctrl+S to finish exporting before leaving.")
+            return
         self.sync_timer.stop()
         self.on_back_callback()
 
@@ -203,6 +210,11 @@ class ClassifyTaskScreen(QWidget):
                 raise ValueError("Cannot decode the source image.")
             crop = original.copy(*task["crop"])
             result = task.get("existing_result") or {}
+            saved = result["points"][0] if result.get("points") else result
+            if saved.get("image_sha256", task["image_sha256"]) != task["image_sha256"]:
+                raise ValueError("The saved label uses an older source image. Use a new image name for a revised source.")
+            if saved.get("crop", task["crop"]) != task["crop"]:
+                raise ValueError("The saved label uses a different AABB crop. Use a new frame name for revised regions.")
             label = result.get("label")
             if label is None and result.get("points"):
                 label = result["points"][0].get("label")
@@ -236,11 +248,14 @@ class ClassifyTaskScreen(QWidget):
             return
         task = self.current_task
         output = Path(task["output_path"])
-        temporary = output.with_name(f".{output.name}.{uuid.uuid4().hex}.tmp")
         try:
-            self.verify_source(task)
+            if output.exists():
+                existing = json.loads(output.read_bytes())
+                if not isinstance(existing, dict) or existing.get("task_id") != task["task_id"]:
+                    raise ValueError("This output file belongs to another task. Choose a separate classification output folder.")
             if self.export_pending is None:
-                points = [{"label": self.selected_label}]
+                self.verify_source(task)
+                points = [{"label": self.selected_label, "image_sha256": task["image_sha256"], "crop": task["crop"]}]
                 try:
                     submitted = self.api.submit_task(task["task_id"], points)
                 except requests.RequestException:
@@ -252,26 +267,22 @@ class ClassifyTaskScreen(QWidget):
                 if not submitted:
                     raise ValueError("Submission failed or the lock changed. Your choice has been kept.")
                 self.export_pending = {
-                    "version": 1, "task_id": task["task_id"], "image": task["image"],
+                    "version": 1, "task_id": task["task_id"], "image": task["image"], "image_sha256": task["image_sha256"],
                     "region": task["region_index"] + 1, "crop": task["crop"],
                     "annotator": self.api.user_id, "label": self.selected_label
                 }
                 self.update_choice()
-            output.parent.mkdir(parents=True, exist_ok=True)
-            with temporary.open("x", encoding="utf-8") as stream:
-                json.dump(self.export_pending, stream, ensure_ascii=False, indent=2)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, output)
+            atomic_write(output, json.dumps(self.export_pending, ensure_ascii=False, indent=2).encode("utf-8"))
         except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError) as error:
             self.status_label.setText(str(error))
             QMessageBox.warning(self, "Save failed", f"{error}\nYour choice is still open. Retry Ctrl+S after resolving the problem.")
             return
-        finally:
-            if temporary.exists():
-                temporary.unlink()
         self.set_current_task(None)
-        self.manual_refresh()
+        try:
+            self.sync_data()
+            self.load_next_task()
+        except (requests.RequestException, OSError, ValueError) as error:
+            self.status_label.setText(f"Saved successfully. Could not refresh tasks: {error}")
 
     def confirm_switch(self):
         if self.export_pending is not None:

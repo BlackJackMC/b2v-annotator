@@ -85,7 +85,7 @@ class MainWindow(QMainWindow):
             elif task_type == "aabb":
                 self.status_bar.showMessage("Shortcuts: [Left Drag] Draw Box | [Left Click] Select Box | [Left Drag on Edge] Move edge | [Delete] Delete selected | [Ctrl + S] Save & Next | [Middle Drag] Pan")
             elif task_type == "svg":
-                self.status_bar.showMessage("[P] Freehand | [L] Polyline | [V] Edit | [Enter] Finish | [Ctrl+Z] Undo | [Ctrl+Shift+Z] Redo | [Ctrl+S] Save | [F] Fit | [Tab] View | [Middle/Right Drag] Pan")
+                self.status_bar.showMessage("SVG: choose visible hints with Shortcuts below the canvas; edit bindings in Keys.")
             elif task_type == "classify":
                 self.status_bar.showMessage("[1/H] Handwriting | [2/K] Sketch | [Esc] Clear | [Ctrl+Z] Undo choice | [Ctrl+S] Save & Next | [F] Fit | [Wheel] Zoom | [Drag] Pan")
 
