@@ -808,8 +808,12 @@ class SVGTaskScreen(QWidget):
         self.history_list.clear()
         done = 0
         for task in self.service.tasks:
-            status = self.service.statuses.get(task["task_id"], {}).get("status", "available")
-            label = task["label"] if status == "done" else f"[{status}] {task['label']}"
+            st = self.service.statuses.get(task["task_id"], {})
+            status = st.get("status", "available")
+            if status == "done":
+                label = f"[pending] {task['label']}" if st.get("pending_sync") else task["label"]
+            else:
+                label = f"[{status}] {task['label']}"
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, task)
             if status == "done":
@@ -819,11 +823,14 @@ class SVGTaskScreen(QWidget):
                 self.region_list.addItem(item)
             if self.current_task and task["task_id"] == self.current_task["task_id"]:
                 item.setSelected(True)
-        self.progress_label.setText(f"Done: {done} / {len(self.service.tasks)}")
+        pending_count = len(self.service.pending_sync)
+        pending_text = f" ({pending_count} pending sync)" if pending_count else ""
+        self.progress_label.setText(f"Done: {done} / {len(self.service.tasks)}{pending_text}")
         self.input_errors = list(self.service.strategy.errors)
         self.errors_button.setVisible(bool(self.input_errors))
         suffix = f" · {len(self.input_errors)} input issues" if self.input_errors else ""
-        self.status_label.setText(f"{len(self.service.tasks)} regions{suffix}")
+        mode = "" if self.service.online else " · Offline (local-first)"
+        self.status_label.setText(f"{len(self.service.tasks)} regions{suffix}{mode}")
 
     def show_input_errors(self):
         box = QMessageBox(self)
@@ -931,22 +938,26 @@ class SVGTaskScreen(QWidget):
                 self.resolve_local_conflict(result["conflict"])
 
         def submit():
-            self.service.submit(task, document)
+            conflict = None
             try:
-                return {"next": self.service.next_region(refresh=False), "error": ""}
+                self.service.submit(task, document)
             except LocalEditsConflict as error:
-                return {"next": None, "error": str(error), "conflict": error.task}
+                conflict = error.task
+            try:
+                return {"next": self.service.next_region(refresh=False), "error": "", "conflict": conflict}
+            except LocalEditsConflict as error:
+                return {"next": None, "error": str(error), "conflict": conflict or error.task}
             except Exception as error:
-                return {"next": None, "error": str(error)}
+                return {"next": None, "error": str(error), "conflict": conflict}
 
         self.saving = True
         self.run_job(submit, saved, "Saving JSON and SVG…", block=True)
 
     def renew_lock(self):
-        if self.worker or not self.current_task or self.service.export_pending is not None:
+        if self.worker or (not self.current_task and not self.service.pending_sync) or self.service.export_pending is not None:
             return
         task = self.current_task
-        self.run_job(lambda: self.service.claim(task), lambda result: None,
+        self.run_job(lambda: self.service.sync_lock(task), lambda result: self.update_regions(),
                      "Renewing task lock…", quiet=True)
 
     def stop_and_back(self):

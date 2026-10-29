@@ -5,10 +5,17 @@ from pathlib import Path
 import requests
 from PyQt6.QtCore import QThread
 from PyQt6.QtGui import QImage, QPainter, QPen, QColor
-from tasks.svg.document import new_annotation, compact_annotation, validate_annotation, prepare_export, write_export
+from tasks.svg.document import (
+    new_annotation, compact_annotation, validate_annotation,
+    prepare_export, write_export, atomic_write
+)
 
 
 class TaskConflict(RuntimeError):
+    pass
+
+
+class OfflineSyncError(RuntimeError):
     pass
 
 
@@ -37,6 +44,7 @@ class TaskWorker(QThread):
 
 class TraceService:
     def __init__(self, api, strategy, config):
+        self.api = api
         self.base_url = api.base_url
         self.user_id = api.user_id
         self.strategy = strategy
@@ -44,23 +52,59 @@ class TraceService:
         self.tasks = []
         self.statuses = {}
         self.pending = {}
+        self.pending_sync = {}
         self.saved_versions = {}
         self.export_pending = None
         self.session = None
         self.source_image = None
         self.source_key = None
+        self.online = True
+        self.load_pending_queue()
+
+    def pending_queue_path(self):
+        output_dir = self.config.get("output")
+        return Path(output_dir) / ".pending_sync_svg.json" if output_dir else None
+
+    def load_pending_queue(self):
+        path = self.pending_queue_path()
+        if not path or not path.is_file():
+            self.pending_sync = {}
+            return
+        try:
+            data = json.loads(path.read_bytes())
+            self.pending_sync = data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            self.pending_sync = {}
+
+    def save_pending_queue(self):
+        path = self.pending_queue_path()
+        if not path:
+            return
+        try:
+            if self.pending_sync:
+                atomic_write(path, json.dumps(self.pending_sync, ensure_ascii=False, indent=2).encode("utf-8"))
+            elif path.exists():
+                path.unlink()
+        except OSError:
+            pass
 
     def post(self, path, payload):
         try:
             if self.session is None:
                 self.session = requests.Session()
             with self.session.post(f"{self.base_url}{path}", json=payload, timeout=(3, 20)) as response:
+                self.online = True
+                self.api.online = True
                 if response.status_code == 409 or (response.status_code == 404 and (path.endswith("/unclaim") or path.count("/") == 2)):
                     raise TaskConflict("This region is locked by another annotator or its status has changed.")
                 response.raise_for_status()
                 return response.json()
+        except TaskConflict:
+            raise
         except (requests.RequestException, ValueError) as error:
-            raise RuntimeError(f"Could not sync tracing with the server: {error}") from error
+            self.online = False
+            self.api.online = False
+            raise OfflineSyncError(f"Could not sync tracing with the server: {error}") from error
 
     def close(self):
         if self.session is not None:
@@ -75,6 +119,21 @@ class TraceService:
         encoded = json.dumps(document, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
         return hashlib.sha256(encoded).hexdigest()
 
+    def local_document(self, task):
+        tid = task["task_id"]
+        if tid in self.pending_sync and "document" in self.pending_sync[tid]:
+            return copy.deepcopy(self.pending_sync[tid]["document"])
+        output = Path(task["output_path"])
+        if not output.is_file():
+            return None
+        try:
+            raw = json.loads(output.read_bytes())
+            doc = compact_annotation(raw, task, self.user_id)
+            validate_annotation(doc, task)
+            return doc
+        except (OSError, ValueError, TypeError, KeyError):
+            return None
+
     def check_status(self, task_ids, include_results=True):
         result = {}
         for offset in range(0, len(task_ids), 200):
@@ -88,26 +147,58 @@ class TraceService:
     def refresh(self, scan=False):
         if scan:
             self.tasks = self.strategy.scan_local_folder(self.config)
-        self.statuses = self.check_status([task["task_id"] for task in self.tasks], include_results=False)
+        conflict = None
+        try:
+            self.flush_pending_sync()
+        except LocalEditsConflict as error:
+            conflict = error
+        except OfflineSyncError:
+            pass
+        try:
+            remote = self.check_status([task["task_id"] for task in self.tasks], include_results=False)
+            self.statuses = remote
+        except OfflineSyncError:
+            for task in self.tasks:
+                tid = task["task_id"]
+                if tid not in self.statuses and Path(task["output_path"]).is_file():
+                    self.statuses[tid] = {"status": "done", "locked_by": None}
+        for tid in self.pending_sync:
+            self.statuses[tid] = {"status": "done", "locked_by": None, "pending_sync": True}
+        if conflict is not None:
+            raise conflict
         return {"tasks": self.tasks, "statuses": self.statuses, "errors": list(self.strategy.errors)}
 
     def claim(self, task, reopen=False):
         action = "reclaim" if reopen else "claim"
         result = self.post(f"/tasks/{task['task_id']}/{action}", {"user_id": self.user_id, "task_type": "svg"})
-        self.statuses[task["task_id"]] = {"status": "processing", "locked_by": self.user_id, "has_result": bool(result.get("existing_result"))}
+        self.statuses[task["task_id"]] = {
+            "status": "processing",
+            "locked_by": self.user_id,
+            "has_result": bool(result.get("existing_result")),
+            "pending_sync": task["task_id"] in self.pending_sync
+        }
         return result
 
     def release(self, task):
         if task:
-            status = self.statuses.get(task["task_id"], {})
-            if status.get("status") == "done" or status.get("locked_by") not in (None, self.user_id):
-                self.saved_versions.pop(task["task_id"], None)
+            tid = task["task_id"]
+            if tid in self.pending_sync:
+                self.statuses[tid] = {"status": "done", "locked_by": None, "pending_sync": True}
                 return
-            result = self.post(f"/tasks/{task['task_id']}/unclaim", {"user_id": self.user_id})
-            previous = self.statuses.pop(task["task_id"], {})
-            self.saved_versions.pop(task["task_id"], None)
-            if previous.get("has_result") or "reverted to done" in result.get("message", ""):
-                self.statuses[task["task_id"]] = {"status": "done", "locked_by": None}
+            status = self.statuses.get(tid, {})
+            if status.get("status") == "done" or status.get("locked_by") not in (None, self.user_id):
+                self.saved_versions.pop(tid, None)
+                return
+            try:
+                result = self.post(f"/tasks/{tid}/unclaim", {"user_id": self.user_id})
+                previous = self.statuses.pop(tid, {})
+                self.saved_versions.pop(tid, None)
+                if previous.get("has_result") or "reverted to done" in result.get("message", ""):
+                    self.statuses[tid] = {"status": "done", "locked_by": None}
+            except (OfflineSyncError, TaskConflict):
+                previous = self.statuses.pop(tid, {})
+                if previous.get("has_result") or Path(task["output_path"]).is_file():
+                    self.statuses[tid] = {"status": "done", "locked_by": None}
 
     def verify_source(self, task):
         info = self.strategy.image_info(Path(task["image_path"]))
@@ -132,8 +223,24 @@ class TraceService:
             raise ValueError("Cannot decode the source image.")
         x, y, width, height = task["source"]["crop_xywh"]
         crop = original.copy(x, y, width, height)
-        result = self.claim(task, reopen)
-        previous = result.get("existing_result")
+        tid = task["task_id"]
+        offline_warning = ""
+        try:
+            try:
+                result = self.claim(task, reopen)
+            except TaskConflict:
+                result = self.claim(task, not reopen)
+            previous = result.get("existing_result")
+        except OfflineSyncError:
+            previous = self.local_document(task)
+            self.statuses[tid] = {
+                "status": "processing",
+                "locked_by": self.user_id,
+                "has_result": bool(previous),
+                "pending_sync": tid in self.pending_sync
+            }
+            offline_warning = "Offline mode — edits are saved locally and queued for sync."
+
         try:
             if previous:
                 previous = compact_annotation(previous, task, self.user_id)
@@ -141,23 +248,42 @@ class TraceService:
         except (ValueError, TypeError, KeyError):
             self.release(task)
             raise
-        cached = self.pending.get(task["task_id"])
+
+        if tid in self.pending_sync:
+            queued_doc = self.pending_sync[tid].get("document")
+            if use_local is False:
+                self.pending_sync.pop(tid, None)
+                self.save_pending_queue()
+                if previous:
+                    write_export(task, previous)
+            elif use_local is True and self.online and queued_doc:
+                self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": queued_doc})
+                self.pending_sync.pop(tid, None)
+                self.save_pending_queue()
+                self.claim(task, reopen=True)
+                previous = queued_doc
+            elif queued_doc:
+                previous = queued_doc
+
+        cached = self.pending.get(tid)
         version = self.document_version(previous)
         if cached and (cached["base"] != version or use_local is False):
             if use_local is None:
                 self.release(task)
                 raise LocalEditsConflict(task)
             if not use_local:
-                self.pending.pop(task["task_id"], None)
+                self.pending.pop(tid, None)
                 cached = None
+                if previous:
+                    write_export(task, previous)
             else:
                 cached["base"] = version
         document = copy.deepcopy(previous) if previous else new_annotation(task, self.user_id)
-        warning = ""
+        warning = offline_warning
         if cached:
             document = copy.deepcopy(cached["document"])
-            warning = "Restored unsaved edits from this session."
-        self.saved_versions[task["task_id"]] = version
+            warning = "Restored unsaved edits from this session." + (f" {offline_warning}" if offline_warning else "")
+        self.saved_versions[tid] = version
         preview = original.scaledToWidth(240)
         painter = QPainter(preview)
         painter.setPen(QPen(QColor("#ff28b5"), 2))
@@ -170,10 +296,16 @@ class TraceService:
         if refresh:
             self.refresh()
         for task in self.tasks:
-            status = self.statuses.get(task["task_id"], {})
+            tid = task["task_id"]
+            if tid in self.pending_sync:
+                continue
+            status = self.statuses.get(tid, {})
             if status.get("status") == "done":
                 continue
             if status.get("status") == "processing" and status.get("locked_by") != self.user_id:
+                continue
+            if not self.online and Path(task["output_path"]).is_file():
+                self.statuses[tid] = {"status": "done", "locked_by": None}
                 continue
             try:
                 return self.load_region(task)
@@ -195,54 +327,117 @@ class TraceService:
             "document": document
         }
 
-    def submit(self, task, document):
-        attempt = self.export_pending
-        if attempt is not None and attempt["task_id"] != task["task_id"]:
-            raise RuntimeError("Finish the previous save before saving another region.")
-        if attempt is None:
-            self.verify_source(task)
-            result = compact_annotation(document, task, self.user_id)
-            contents = prepare_export(task, result)
-            attempt = {"task_id": task["task_id"], "document": result,
-                       "contents": contents, "submitted": False}
-        result = attempt["document"]
-        if not attempt["submitted"]:
-            status = self.check_status([task["task_id"]]).get(task["task_id"], {})
+    def flush_pending_sync(self):
+        if not self.pending_sync:
+            return
+        task_map = {t["task_id"]: t for t in self.tasks}
+        changed = False
+        conflict_task = None
+
+        for tid in list(self.pending_sync.keys()):
+            entry = self.pending_sync[tid]
+            result = entry.get("document")
+            base = entry.get("base")
+            task = task_map.get(tid, {"task_id": tid, "output_path": entry.get("output_path", "")})
+            try:
+                status = self.check_status([tid]).get(tid, {})
+            except OfflineSyncError:
+                break
+
             if status.get("status") == "done":
-                if status.get("result") != result:
-                    self.export_pending = None
-                    self.remember(task, result)
-                    self.statuses[task["task_id"]] = {"status": "done", "locked_by": None}
-                    raise LocalEditsConflict(task)
-                attempt["submitted"] = True
-                self.export_pending = attempt
-            else:
+                if status.get("result") == result:
+                    self.pending_sync.pop(tid, None)
+                    self.statuses[tid] = {"status": "done", "locked_by": None}
+                    changed = True
+                    continue
+                if base is not None and self.document_version(status.get("result")) == base:
+                    try:
+                        self.claim(task, reopen=True)
+                        self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": result})
+                        self.pending_sync.pop(tid, None)
+                        self.statuses[tid] = {"status": "done", "locked_by": None}
+                        changed = True
+                        continue
+                    except OfflineSyncError:
+                        break
+                    except TaskConflict:
+                        pass
+                self.pending[tid] = {"base": base, "document": result}
+                self.statuses[tid] = {"status": "done", "locked_by": None, "pending_sync": True}
+                conflict_task = task
+                continue
+
+            if status.get("status") == "processing" and status.get("locked_by") not in (None, self.user_id):
+                continue
+
+            try:
+                self.claim(task)
+                self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": result})
+                self.pending_sync.pop(tid, None)
+                self.statuses[tid] = {"status": "done", "locked_by": None}
+                changed = True
+            except OfflineSyncError:
+                break
+            except TaskConflict:
                 try:
-                    self.claim(task)
-                except TaskConflict:
-                    self.export_pending = None
-                    raise
-                self.export_pending = attempt
-                try:
-                    self.post(f"/tasks/{task['task_id']}", {"user_id": self.user_id, "result": result})
-                    attempt["submitted"] = True
-                except RuntimeError as error:
-                    if isinstance(error, TaskConflict):
-                        self.export_pending = None
-                    status = self.check_status([task["task_id"]]).get(task["task_id"], {})
-                    if status.get("status") == "done" and status.get("result") == result:
-                        attempt["submitted"] = True
-                        self.export_pending = attempt
-                    elif status.get("status") == "done":
-                        self.export_pending = None
-                        self.remember(task, result)
-                        self.statuses[task["task_id"]] = {"status": "done", "locked_by": None}
-                        raise LocalEditsConflict(task)
+                    recheck = self.check_status([tid]).get(tid, {})
+                except OfflineSyncError:
+                    break
+                if recheck.get("status") == "done":
+                    if recheck.get("result") == result:
+                        self.pending_sync.pop(tid, None)
+                        self.statuses[tid] = {"status": "done", "locked_by": None}
+                        changed = True
                     else:
-                        raise
-        write_export(task, result, contents=attempt["contents"])
+                        self.pending[tid] = {"base": base, "document": result}
+                        self.statuses[tid] = {"status": "done", "locked_by": None, "pending_sync": True}
+                        conflict_task = task
+
+        if changed:
+            self.save_pending_queue()
+        if conflict_task is not None:
+            raise LocalEditsConflict(conflict_task)
+
+    def sync_lock(self, current_task=None):
+        self.flush_pending_sync()
+        if current_task:
+            try:
+                self.claim(current_task)
+            except OfflineSyncError:
+                pass
+            except TaskConflict:
+                tid = current_task["task_id"]
+                try:
+                    status = self.check_status([tid]).get(tid, {})
+                except OfflineSyncError:
+                    return
+                if status.get("status") == "done":
+                    server_ver = self.document_version(status.get("result"))
+                    if server_ver != self.saved_versions.get(tid):
+                        raise LocalEditsConflict(current_task)
+
+    def submit(self, task, document):
+        tid = task["task_id"]
+        self.verify_source(task)
+        result = compact_annotation(document, task, self.user_id)
+        contents = prepare_export(task, result)
+        write_export(task, result, contents=contents)
+
+        base = self.saved_versions.get(tid)
+        self.pending_sync[tid] = {
+            "task_id": tid,
+            "document": result,
+            "base": base,
+            "output_path": task.get("output_path")
+        }
+        self.save_pending_queue()
         self.export_pending = None
-        self.pending.pop(task["task_id"], None)
-        self.saved_versions.pop(task["task_id"], None)
-        self.statuses[task["task_id"]] = {"status": "done", "locked_by": None}
+        self.pending.pop(tid, None)
+        self.saved_versions[tid] = self.document_version(result)
+        self.statuses[tid] = {"status": "done", "locked_by": None, "pending_sync": True}
+
+        try:
+            self.flush_pending_sync()
+        except OfflineSyncError:
+            pass
         return result
