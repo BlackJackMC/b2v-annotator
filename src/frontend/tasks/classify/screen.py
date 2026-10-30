@@ -1,12 +1,13 @@
 import json
 from pathlib import Path
+from typing import Dict, List
 import requests
 from PyQt6.QtCore import Qt, QTimer, QEvent
 from PyQt6.QtGui import QImage, QPainter, QPen, QColor, QPixmap, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QMessageBox
+from core.data_manager import TaskSyncWorker
 from core.api_client import APIClient
 from tasks.classify.canvas import ImageCanvas
-from tasks.svg.document import atomic_write
 
 
 class ClassifyTaskScreen(QWidget):
@@ -20,6 +21,8 @@ class ClassifyTaskScreen(QWidget):
         self.selected_label = None
         self.initial_label = None
         self.export_pending = None
+        self.sync_worker = None
+        self.prompting_conflict = False
         self.history = []
         self.shortcuts = []
         self.close_target = None
@@ -139,45 +142,111 @@ class ClassifyTaskScreen(QWidget):
         self.selection_label.setText(f"Selected: {self.selected_label.title()} · Ctrl+S to save"
                                      if self.selected_label else "Choose one label, then save.")
 
+    def sync_suffix(self) -> str:
+        pending = self.data_manager.pending_count(self.task_type)
+        if not self.api.online:
+            return f" (Offline — {pending} pending sync)" if pending else " (Offline — local-first mode)"
+        if pending:
+            return f" ({pending} pending sync)"
+        return ""
+
     def start_task(self):
         self.manual_refresh()
         self.sync_timer.start(30000)
 
     def stop_and_back(self):
-        if self.export_pending is not None:
-            self.status_label.setText("Retry Ctrl+S to finish exporting before leaving.")
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
+        if not self.confirm_switch():
             return
         self.sync_timer.stop()
+        self.data_manager.release_task(self.task_type, self.current_task)
+        self.set_current_task(None)
         self.on_back_callback()
 
     def manual_refresh(self):
-        try:
-            self.data_manager.scan_local_folder(self.task_type)
-            self.sync_data()
-            self.errors_button.setVisible(bool(self.data_manager.strategies[self.task_type].errors))
-            if self.current_task is None:
-                self.load_next_task()
-        except (requests.RequestException, OSError, ValueError) as error:
-            self.status_label.setText(f"Could not refresh: {error}")
+        self.start_sync(scan=True)
 
     def sync_data_timer(self):
-        try:
-            if self.current_task and self.export_pending is None:
-                if not self.api.claim_task(self.current_task["task_id"], self.task_type):
-                    self.status_label.setText("Could not renew the task lock. Your choice is still open.")
-            self.sync_data()
-        except (requests.RequestException, ValueError) as error:
-            self.status_label.setText(f"Could not sync: {error}")
+        self.start_sync()
+
+    def start_sync(self, scan=False):
+        if self.sync_worker is not None or self.prompting_conflict:
+            return
+        worker = TaskSyncWorker(self.data_manager, self.task_type, self.current_task, scan, self)
+        self.sync_worker = worker
+        window = self.window()
+        window.installEventFilter(worker)
+
+        def finished():
+            window.removeEventFilter(worker)
+            self.sync_worker = None
+            if worker.error:
+                self.status_label.setText(worker.error)
+            else:
+                try:
+                    if worker.task is None:
+                        self.set_current_task(worker.next_task)
+                    self.sync_data()
+                    self.errors_button.setVisible(bool(self.data_manager.strategies[self.task_type].errors))
+                    self.handle_conflicts(worker.conflicts)
+                except (OSError, ValueError) as error:
+                    self.status_label.setText(str(error))
+            worker.deleteLater()
+
+        worker.finished.connect(finished)
+        worker.start()
 
     def sync_data(self):
-        done_tasks = self.data_manager.get_done_tasks(self.task_type)
-        processing_tasks = self.data_manager.get_processing_tasks(self.task_type)
+        done_tasks = self.data_manager.get_done_tasks(self.task_type, refresh=False)
+        processing_tasks = self.data_manager.get_processing_tasks(self.task_type, refresh=False)
         for widget, tasks in [(self.history_list, done_tasks), (self.processing_list, processing_tasks)]:
             widget.clear()
             for task in tasks:
-                item = QListWidgetItem(task["label"])
+                label = f"[pending] {task['label']}" if task.get("pending_sync") else task["label"]
+                if task.get("expired"):
+                    label = f"[expired] {label}"
+                item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, task)
                 widget.addItem(item)
+
+    def handle_conflicts(self, conflicts: List[Dict]):
+        if not conflicts or self.prompting_conflict:
+            return
+        self.prompting_conflict = True
+        try:
+            for conflict in conflicts:
+                ctype = conflict.get("type")
+                tid = conflict.get("task_id")
+                if ctype in ("locked", "locked_active"):
+                    owner = conflict.get("locked_by") or "another user"
+                    self.status_label.setText(f"Region {tid} is currently locked by {owner}.{self.sync_suffix()}")
+                    continue
+                if ctype in ("done", "done_active"):
+                    box = QMessageBox(self)
+                    box.setWindowTitle("Saved result changed")
+                    box.setText(f"Region {tid} has a newer server result. Choose which classification to keep.")
+                    local_btn = box.addButton("Keep local edits", QMessageBox.ButtonRole.AcceptRole)
+                    server_btn = box.addButton("Use server result", QMessageBox.ButtonRole.DestructiveRole)
+                    box.addButton(QMessageBox.StandardButton.Cancel)
+                    box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+                    box.exec()
+                    clicked = box.clickedButton()
+                    if clicked is local_btn:
+                        if ctype == "done_active" and self.current_task and self.current_task["task_id"] == tid:
+                            self.api.reclaim_task(tid, self.task_type)
+                            self.current_task["existing_result"] = conflict.get("server_result")
+                        else:
+                            self.data_manager.resolve_conflict(self.task_type, conflict, use_local=True)
+                    elif clicked is server_btn:
+                        updated = self.data_manager.resolve_conflict(self.task_type, conflict, use_local=False)
+                        if self.current_task and self.current_task["task_id"] == tid and updated:
+                            self.api.reclaim_task(tid, self.task_type)
+                            self.set_current_task(updated)
+            self.sync_data()
+        finally:
+            self.prompting_conflict = False
 
     def show_input_errors(self):
         box = QMessageBox(self)
@@ -196,6 +265,9 @@ class ClassifyTaskScreen(QWidget):
             raise ValueError("The AABB changed. Refresh inputs before classifying it.")
 
     def load_next_task(self):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         try:
             task = self.data_manager.get_free_task(self.task_type)
             self.set_current_task(task)
@@ -230,13 +302,13 @@ class ClassifyTaskScreen(QWidget):
             self.context_label.setPixmap(QPixmap.fromImage(preview))
             self.region_label.setText(task["label"])
             self.selected_label = label
-            self.status_label.setText("Choose the content type of this region.")
+            self.status_label.setText(f"Choose the content type of this region.{self.sync_suffix()}")
         else:
             self.canvas.show_empty_state()
             self.context_label.clear()
             self.region_label.setText("No available regions")
             self.selected_label = None
-            self.status_label.setText("Refresh inputs or select a saved task to edit.")
+            self.status_label.setText(f"Refresh inputs or select a saved task to edit.{self.sync_suffix()}")
         self.current_task = task
         self.initial_label = self.selected_label
         self.export_pending = None
@@ -244,6 +316,9 @@ class ClassifyTaskScreen(QWidget):
         self.update_choice()
 
     def save_and_submit(self):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         if not self.current_task or self.selected_label not in ("handwriting", "sketch"):
             return
         task = self.current_task
@@ -253,36 +328,20 @@ class ClassifyTaskScreen(QWidget):
                 existing = json.loads(output.read_bytes())
                 if not isinstance(existing, dict) or existing.get("task_id") != task["task_id"]:
                     raise ValueError("This output file belongs to another task. Choose a separate classification output folder.")
-            if self.export_pending is None:
-                self.verify_source(task)
-                points = [{"label": self.selected_label, "image_sha256": task["image_sha256"], "crop": task["crop"]}]
-                try:
-                    submitted = self.api.submit_task(task["task_id"], points)
-                except requests.RequestException:
-                    submitted = False
-                if not submitted:
-                    statuses = self.api.check_status([task["task_id"]])
-                    submitted = any(status.get("status") == "done" and status.get("result") == {"points": points}
-                                    for status in statuses if status.get("task_id") == task["task_id"])
-                if not submitted:
-                    raise ValueError("Submission failed or the lock changed. Your choice has been kept.")
-                self.export_pending = {
-                    "version": 1, "task_id": task["task_id"], "image": task["image"], "image_sha256": task["image_sha256"],
-                    "region": task["region_index"] + 1, "crop": task["crop"],
-                    "annotator": self.api.user_id, "label": self.selected_label
-                }
-                self.update_choice()
-            atomic_write(output, json.dumps(self.export_pending, ensure_ascii=False, indent=2).encode("utf-8"))
+            self.verify_source(task)
+            points = [{"label": self.selected_label, "image_sha256": task["image_sha256"], "crop": task["crop"]}]
+            conflicts = self.data_manager.save_task_local_first(self.task_type, task, points)
         except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError) as error:
             self.status_label.setText(str(error))
             QMessageBox.warning(self, "Save failed", f"{error}\nYour choice is still open. Retry Ctrl+S after resolving the problem.")
             return
         self.set_current_task(None)
+        self.handle_conflicts(conflicts)
         try:
             self.sync_data()
             self.load_next_task()
         except (requests.RequestException, OSError, ValueError) as error:
-            self.status_label.setText(f"Saved successfully. Could not refresh tasks: {error}")
+            self.status_label.setText(f"Saved locally. Could not refresh tasks: {error}")
 
     def confirm_switch(self):
         if self.export_pending is not None:
@@ -296,25 +355,35 @@ class ClassifyTaskScreen(QWidget):
         return choice == QMessageBox.StandardButton.Discard
 
     def open_task(self, task, reopen=False):
-        if self.current_task and self.current_task["task_id"] == task["task_id"]:
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
+        if self.current_task and self.current_task["task_id"] == task["task_id"] and not task.get("expired"):
             return
         if not self.confirm_switch():
             return
         try:
             self.verify_source(task)
-            result = self.api.reclaim_task(task["task_id"]) if reopen else self.api.claim_task(task["task_id"], self.task_type)
-            if not result:
+            opened = self.data_manager.open_task(self.task_type, task, reopen=reopen)
+            if not opened:
                 raise ValueError("Cannot lock this task. Your current choice has been kept.")
-            task = dict(task, existing_result=result.get("existing_result"))
-            self.set_current_task(task)
+            if self.current_task and self.current_task["task_id"] != opened["task_id"]:
+                self.data_manager.release_task(self.task_type, self.current_task)
+            self.set_current_task(opened)
             self.sync_data()
         except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError) as error:
             QMessageBox.warning(self, "Classification", str(error))
 
     def on_processing_clicked(self, item):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         self.open_task(item.data(Qt.ItemDataRole.UserRole))
 
     def on_history_clicked(self, item):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         self.open_task(item.data(Qt.ItemDataRole.UserRole), reopen=True)
 
     def showEvent(self, event):

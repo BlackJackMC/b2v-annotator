@@ -1,7 +1,7 @@
 from typing import List, Dict
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsTextItem
-from PyQt6.QtCore import Qt, QPoint, QPointF
-from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter
+from PyQt6.QtCore import Qt, QPoint, QPointF, pyqtSignal
+from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter, QKeySequence
 
 class DraggablePoint(QGraphicsEllipseItem):
     def __init__(self, x, y, canvas, is_first=False):
@@ -9,6 +9,7 @@ class DraggablePoint(QGraphicsEllipseItem):
         self.setPos(x, y)
         self.setBrush(QBrush(QColor("red" if is_first else "blue")))
         self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsMovable)
+        self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemIsSelectable)
         self.setFlag(QGraphicsEllipseItem.GraphicsItemFlag.ItemSendsGeometryChanges)
         self.canvas = canvas
         self.is_first = is_first
@@ -33,6 +34,8 @@ class DraggablePoint(QGraphicsEllipseItem):
 
 
 class ImageCanvas(QGraphicsView):
+    message = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.scene = QGraphicsScene(self)
@@ -42,6 +45,9 @@ class ImageCanvas(QGraphicsView):
         self.is_closed = False
         self.image_item = None
         self.is_editable = False
+        self.copied_points = []
+        self.copied_image_size = None
+        self.setToolTip("Ctrl+A: select all four corners. Ctrl+C: copy OBB. Ctrl+V: replace the current OBB at the original coordinates.")
         
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -117,6 +123,7 @@ class ImageCanvas(QGraphicsView):
 
     def show_empty_state(self):
         self.scene.clear()
+        self.image_item = None
         self.points.clear()
         self.lines.clear()
         self.is_closed = False
@@ -185,6 +192,36 @@ class ImageCanvas(QGraphicsView):
     def close_polygon(self):
         self.is_closed = True
         self.update_lines()
+
+    def keyPressEvent(self, event):
+        if not self.is_editable:
+            return super().keyPressEvent(event)
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            for point in self.points:
+                point.setSelected(True)
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Copy):
+            if self.is_closed and len(self.points) == 4 and all(point.isSelected() for point in self.points):
+                self.copied_points = self.get_coordinates()
+                self.copied_image_size = self.image_item.pixmap().size()
+                self.message.emit("Copied OBB with all four corners.")
+            else:
+                self.message.emit("Select all four corners of a completed OBB with Ctrl+A before copying.")
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Paste):
+            if self.copied_points:
+                if self.image_item.pixmap().size() != self.copied_image_size:
+                    self.message.emit("Cannot paste: image dimensions differ. Coordinates were not changed.")
+                else:
+                    self.load_existing_points(self.copied_points)
+                    for point in self.points:
+                        point.setSelected(True)
+                    self.message.emit("Pasted OBB at its original coordinates, replacing the previous OBB.")
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def get_coordinates(self) -> List[Dict]:
         if not self.is_closed: return []
