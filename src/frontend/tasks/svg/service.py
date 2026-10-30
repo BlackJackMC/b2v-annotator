@@ -85,8 +85,8 @@ class TraceService:
                 atomic_write(path, json.dumps(self.pending_sync, ensure_ascii=False, indent=2).encode("utf-8"))
             elif path.exists():
                 path.unlink()
-        except OSError:
-            pass
+        except OSError as error:
+            raise OSError(f"Could not persist the sync queue. Keep this session open and retry Save: {error}") from error
 
     def post(self, path, payload):
         try:
@@ -136,6 +136,8 @@ class TraceService:
 
     def check_status(self, task_ids, include_results=True):
         result = {}
+        if not task_ids and not self.online:
+            self.post("/tasks", {"task_ids": []})
         for offset in range(0, len(task_ids), 200):
             data = self.post("/tasks", {"task_ids": task_ids[offset:offset + 200]})
             for task in data["tasks"]:
@@ -225,21 +227,8 @@ class TraceService:
         crop = original.copy(x, y, width, height)
         tid = task["task_id"]
         offline_warning = ""
-        try:
-            try:
-                result = self.claim(task, reopen)
-            except TaskConflict:
-                result = self.claim(task, not reopen)
-            previous = result.get("existing_result")
-        except OfflineSyncError:
-            previous = self.local_document(task)
-            self.statuses[tid] = {
-                "status": "processing",
-                "locked_by": self.user_id,
-                "has_result": bool(previous),
-                "pending_sync": tid in self.pending_sync
-            }
-            offline_warning = "Offline mode — edits are saved locally and queued for sync."
+        result = self.claim(task, reopen)
+        previous = result.get("existing_result")
 
         try:
             if previous:
@@ -257,11 +246,9 @@ class TraceService:
                 if previous:
                     write_export(task, previous)
             elif use_local is True and self.online and queued_doc:
-                self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": queued_doc})
+                self.pending[tid] = {"base": self.document_version(previous), "document": queued_doc}
                 self.pending_sync.pop(tid, None)
                 self.save_pending_queue()
-                self.claim(task, reopen=True)
-                previous = queued_doc
             elif queued_doc:
                 previous = queued_doc
 
@@ -352,7 +339,10 @@ class TraceService:
                     continue
                 if base is not None and self.document_version(status.get("result")) == base:
                     try:
-                        self.claim(task, reopen=True)
+                        claimed = self.claim(task, reopen=True)
+                        if self.document_version(claimed.get("existing_result")) != base:
+                            self.post(f"/tasks/{tid}/unclaim", {"user_id": self.user_id})
+                            raise TaskConflict("The server result changed while acquiring the task.")
                         self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": result})
                         self.pending_sync.pop(tid, None)
                         self.statuses[tid] = {"status": "done", "locked_by": None}
@@ -411,6 +401,8 @@ class TraceService:
                     status = self.check_status([tid]).get(tid, {})
                 except OfflineSyncError:
                     return
+                if status.get("status") == "processing" and status.get("locked_by") not in (None, self.user_id):
+                    raise TaskConflict(f"Task {tid} is now locked by {status.get('locked_by')}. Your edits remain local; Save queues them until the task is available.")
                 if status.get("status") == "done":
                     server_ver = self.document_version(status.get("result"))
                     if server_ver != self.saved_versions.get(tid):

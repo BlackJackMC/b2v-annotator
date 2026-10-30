@@ -893,7 +893,8 @@ class SVGTaskScreen(QWidget):
     def open_region(self, task, use_local=None):
         if self.worker or self.service.export_pending is not None:
             return
-        if self.current_task and self.current_task["task_id"] == task["task_id"] and use_local is None:
+        if (self.current_task and self.current_task["task_id"] == task["task_id"] and use_local is None
+                and self.service.statuses.get(task["task_id"], {}).get("status") != "expired"):
             return
         self.canvas.finish_drawing()
         previous = self.current_task
@@ -954,9 +955,12 @@ class SVGTaskScreen(QWidget):
         self.run_job(submit, saved, "Saving JSON and SVG…", block=True)
 
     def renew_lock(self):
-        if self.worker or (not self.current_task and not self.service.pending_sync) or self.service.export_pending is not None:
+        if self.worker or self.service.export_pending is not None:
             return
         task = self.current_task
+        if task is None:
+            self.run_job(self.service.refresh, self.update_regions, "Checking connection…", quiet=True)
+            return
         self.run_job(lambda: self.service.sync_lock(task), lambda result: self.update_regions(),
                      "Renewing task lock…", quiet=True)
 

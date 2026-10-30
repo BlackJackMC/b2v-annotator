@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 from typing import Dict, List, Optional
+from PyQt6.QtCore import QThread, QEvent
 from core.api_client import APIClient, OfflineError, TaskConflictError
 from tasks.obb.strategy import OBBStrategy
 from tasks.aabb.strategy import AABBStrategy
@@ -67,8 +68,8 @@ class DataManager:
                 atomic_write(path, json.dumps(queue, ensure_ascii=False, indent=2).encode("utf-8"))
             elif path.exists():
                 path.unlink()
-        except OSError:
-            pass
+        except OSError as error:
+            raise OSError(f"Could not persist the sync queue. Keep this session open and retry Save: {error}") from error
 
     def pending_count(self, task_type: str) -> int:
         return len(self.pending_sync.get(task_type, {}))
@@ -131,14 +132,19 @@ class DataManager:
             return
         atomic_write(output_path, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
 
-    def refresh_statuses(self, task_type: str) -> Dict[str, Dict]:
+    def refresh_statuses(self, task_type: str, refresh=True) -> Dict[str, Dict]:
         tasks = self.cached_tasks.get(task_type, [])
         cache = self.status_cache.setdefault(task_type, {})
         if not tasks:
+            if refresh and not self.api.online:
+                try:
+                    self.api.post("/tasks", {"task_ids": []})
+                except (OfflineError, TaskConflictError):
+                    pass
             return {}
         task_ids = [t["task_id"] for t in tasks]
         try:
-            remote_list = self.api.check_status(task_ids, raise_on_error=True)
+            remote_list = self.api.check_status(task_ids, raise_on_error=True) if refresh else list(cache.values())
             new_cache = {}
             for item in remote_list:
                 new_cache[item["task_id"]] = item
@@ -204,7 +210,11 @@ class DataManager:
                     continue
                 if base_result is not None and server_result == base_result:
                     try:
-                        self.api.reclaim_task(tid, task_type, raise_on_error=True)
+                        claimed = self.api.reclaim_task(tid, task_type, raise_on_error=True)
+                        if claimed.get("existing_result") != base_result:
+                            server_result = claimed.get("existing_result")
+                            self.api.unclaim_task(tid, raise_on_error=True)
+                            raise TaskConflictError("The server result changed while acquiring the task.")
                         self.api.submit_task(tid, local_result, raise_on_error=True)
                         queue.pop(tid, None)
                         self.status_cache.setdefault(task_type, {})[tid] = {
@@ -386,14 +396,6 @@ class DataManager:
 
         for task in free_tasks:
             tid = task["task_id"]
-            if not self.api.online:
-                if tid not in existing_results and os.path.isfile(task.get("output_path", "")):
-                    continue
-                task_copy = task.copy()
-                task_copy["existing_result"] = existing_results.get(tid) or self.local_result_for_task(task_type, task)
-                self.local_locks[task_type] = tid
-                return task_copy
-
             try:
                 claim_res = self.api.claim_task(tid, task_type, raise_on_error=True)
                 if claim_res:
@@ -407,12 +409,7 @@ class DataManager:
                     self.local_locks[task_type] = tid
                     return task_copy
             except OfflineError:
-                if tid not in existing_results and os.path.isfile(task.get("output_path", "")):
-                    continue
-                task_copy = task.copy()
-                task_copy["existing_result"] = existing_results.get(tid) or self.local_result_for_task(task_type, task)
-                self.local_locks[task_type] = tid
-                return task_copy
+                return None
             except TaskConflictError:
                 continue
         return None
@@ -423,27 +420,17 @@ class DataManager:
         pending = self.pending_sync.get(task_type, {}).get(tid)
 
         try:
-            if reopen and not pending:
+            if reopen:
                 res = self.api.reclaim_task(tid, task_type, raise_on_error=True)
             else:
-                try:
-                    res = self.api.claim_task(tid, task_type, raise_on_error=True)
-                except TaskConflictError:
-                    res = self.api.reclaim_task(tid, task_type, raise_on_error=True)
+                res = self.api.claim_task(tid, task_type, raise_on_error=True)
             if res:
                 task_copy["existing_result"] = (
                     pending.get("result") if pending else res.get("existing_result") or self.local_result_for_task(task_type, task)
                 )
                 self.local_locks[task_type] = tid
                 return task_copy
-        except OfflineError:
-            cached_st = self.status_cache.get(task_type, {}).get(tid, {})
-            task_copy["existing_result"] = (
-                pending.get("result") if pending else cached_st.get("result") or self.local_result_for_task(task_type, task)
-            )
-            self.local_locks[task_type] = tid
-            return task_copy
-        except TaskConflictError:
+        except (OfflineError, TaskConflictError):
             return None
         return None
 
@@ -457,12 +444,12 @@ class DataManager:
             return
         self.api.unclaim_task(tid)
 
-    def get_done_tasks(self, task_type: str):
+    def get_done_tasks(self, task_type: str, refresh=True):
         tasks = self.cached_tasks.get(task_type, [])
         if not tasks:
             return []
 
-        statuses = self.refresh_statuses(task_type)
+        statuses = self.refresh_statuses(task_type, refresh=refresh)
         done_ids = {tid for tid, st in statuses.items() if st.get("status") == "done"}
 
         result = []
@@ -474,12 +461,12 @@ class DataManager:
                 result.append(task_copy)
         return result
 
-    def get_processing_tasks(self, task_type: str):
+    def get_processing_tasks(self, task_type: str, refresh=True):
         tasks = self.cached_tasks.get(task_type, [])
         if not tasks:
             return []
 
-        statuses = self.refresh_statuses(task_type)
+        statuses = self.refresh_statuses(task_type, refresh=refresh)
         my_user = self.api.user_id
 
         processing_tasks = []
@@ -487,9 +474,40 @@ class DataManager:
             tid = t["task_id"]
             if tid in statuses and os.path.exists(t["image_path"]):
                 st = statuses[tid]
-                if st.get("status") == "processing" and st.get("locked_by") == my_user:
+                if st.get("status") == "expired" or (st.get("status") == "processing" and st.get("locked_by") == my_user):
                     task_copy = t.copy()
                     task_copy["existing_result"] = st.get("result") or self.local_result_for_task(task_type, t)
+                    task_copy["expired"] = st.get("status") == "expired"
                     processing_tasks.append(task_copy)
 
         return processing_tasks
+
+
+class TaskSyncWorker(QThread):
+    def __init__(self, manager, task_type, task, scan, parent):
+        super().__init__(parent)
+        self.manager = manager
+        self.task_type = task_type
+        self.task = dict(task) if task else None
+        self.scan = scan
+        self.conflicts = []
+        self.next_task = None
+        self.error = None
+
+    def run(self):
+        try:
+            if self.scan:
+                self.manager.scan_local_folder(self.task_type)
+            self.conflicts = self.manager.sync_task_state(self.task_type, self.task)
+            self.manager.refresh_statuses(self.task_type)
+            if self.task is None:
+                self.next_task = self.manager.get_free_task(self.task_type)
+        except Exception as error:
+            self.error = str(error)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Close and self.isRunning():
+            event.ignore()
+            self.parent().status_label.setText("Please wait for synchronization before closing.")
+            return True
+        return super().eventFilter(watched, event)

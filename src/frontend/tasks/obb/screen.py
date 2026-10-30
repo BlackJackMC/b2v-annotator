@@ -2,6 +2,7 @@ import os
 from typing import Dict, List
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QPushButton, QMessageBox, QListWidgetItem, QLabel
 from PyQt6.QtCore import Qt, QTimer
+from core.data_manager import TaskSyncWorker
 from core.api_client import APIClient
 from tasks.obb.canvas import ImageCanvas
 
@@ -14,6 +15,7 @@ class OBBTaskScreen(QWidget):
         self.on_back_callback = on_back_callback
         self.current_task = None
         self.task_type = "obb"
+        self.sync_worker = None
         self.prompting_conflict = False
 
         self.sync_timer = QTimer(self)
@@ -58,6 +60,9 @@ class OBBTaskScreen(QWidget):
         layout.addLayout(right_panel, stretch=1)
 
     def stop_and_back(self):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         self.sync_timer.stop()
         self.data_manager.release_task(self.task_type, self.current_task)
         self.current_task = None
@@ -65,8 +70,6 @@ class OBBTaskScreen(QWidget):
 
     def start_task(self):
         self.manual_refresh()
-        if self.current_task is None:
-            self.load_next_task()
         self.sync_timer.start(10000)
 
     def update_sync_status(self, extra: str = ""):
@@ -80,24 +83,40 @@ class OBBTaskScreen(QWidget):
         self.status_label.setText(text)
 
     def manual_refresh(self):
-        self.data_manager.scan_local_folder(self.task_type)
-        conflicts = self.data_manager.sync_task_state(self.task_type, self.current_task)
-        self.sync_data()
-        self.handle_conflicts(conflicts)
-
-        if self.current_task is None:
-            self.load_next_task()
+        self.start_sync(scan=True)
 
     def sync_data_timer(self):
-        conflicts = self.data_manager.sync_task_state(self.task_type, self.current_task)
-        self.sync_data()
-        self.handle_conflicts(conflicts)
-        if self.current_task is None:
-            self.load_next_task()
+        self.start_sync()
+
+    def start_sync(self, scan=False):
+        if self.sync_worker is not None or self.prompting_conflict:
+            return
+        worker = TaskSyncWorker(self.data_manager, self.task_type, self.current_task, scan, self)
+        self.sync_worker = worker
+        window = self.window()
+        window.installEventFilter(worker)
+
+        def finished():
+            window.removeEventFilter(worker)
+            self.sync_worker = None
+            if worker.error:
+                self.status_label.setText(worker.error)
+            else:
+                try:
+                    if worker.task is None:
+                        self.set_current_task(worker.next_task)
+                    self.sync_data()
+                    self.handle_conflicts(worker.conflicts)
+                except (OSError, ValueError) as error:
+                    self.status_label.setText(str(error))
+            worker.deleteLater()
+
+        worker.finished.connect(finished)
+        worker.start()
 
     def sync_data(self):
         self.history_list.clear()
-        done_tasks = self.data_manager.get_done_tasks(self.task_type)
+        done_tasks = self.data_manager.get_done_tasks(self.task_type, refresh=False)
         for task in done_tasks:
             label = f"[pending] {task['task_id']}" if task.get("pending_sync") else task["task_id"]
             item = QListWidgetItem(label)
@@ -105,9 +124,10 @@ class OBBTaskScreen(QWidget):
             self.history_list.addItem(item)
 
         self.processing_list.clear()
-        processing_tasks = self.data_manager.get_processing_tasks(self.task_type)
+        processing_tasks = self.data_manager.get_processing_tasks(self.task_type, refresh=False)
         for task in processing_tasks:
-            item = QListWidgetItem(task["task_id"])
+            label = f"[expired] {task['task_id']}" if task.get("expired") else task["task_id"]
+            item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, task)
             self.processing_list.addItem(item)
 
@@ -164,6 +184,9 @@ class OBBTaskScreen(QWidget):
                 self.save_and_submit(coords)
 
     def save_and_submit(self, coords):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         if not self.current_task:
             return
 
@@ -175,12 +198,20 @@ class OBBTaskScreen(QWidget):
             self.load_next_task()
             return
 
-        conflicts = self.data_manager.save_task_local_first(self.task_type, self.current_task, coords)
+        try:
+            conflicts = self.data_manager.save_task_local_first(self.task_type, self.current_task, coords)
+        except OSError as error:
+            self.status_label.setText(str(error))
+            QMessageBox.warning(self, "Save failed", str(error))
+            return
         self.handle_conflicts(conflicts)
         self.sync_data()
         self.load_next_task()
 
     def load_next_task(self):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         task = self.data_manager.get_free_task(task_type=self.task_type)
         self.set_current_task(task)
         self.update_sync_status()
@@ -198,6 +229,9 @@ class OBBTaskScreen(QWidget):
             self.canvas.show_empty_state()
 
     def on_processing_clicked(self, item):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         task_info = item.data(Qt.ItemDataRole.UserRole)
 
         if not os.path.exists(task_info['image_path']):
@@ -215,6 +249,9 @@ class OBBTaskScreen(QWidget):
             QMessageBox.warning(self, "Error", "Cannot lock this task.")
 
     def on_history_clicked(self, item):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         task_info = item.data(Qt.ItemDataRole.UserRole)
 
         if not os.path.exists(task_info['image_path']):

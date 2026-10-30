@@ -82,7 +82,8 @@ class TaskUseCase:
             {
                 "task_id": task_id,
                 "locked_by": request.user_id,
-                "status": "processing"
+                "status": "processing",
+                "locked_at": {"$gte": datetime.now(timezone.utc) - timedelta(minutes=settings.LOCK_TIMEOUT_MINUTES)}
             },
             {"$set": {"status": "done", "result": request.result, "locked_by": None, "locked_at": None}},
             return_document=ReturnDocument.AFTER

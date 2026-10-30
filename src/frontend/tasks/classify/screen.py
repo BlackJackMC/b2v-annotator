@@ -5,6 +5,7 @@ import requests
 from PyQt6.QtCore import Qt, QTimer, QEvent
 from PyQt6.QtGui import QImage, QPainter, QPen, QColor, QPixmap, QKeySequence, QShortcut
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QMessageBox
+from core.data_manager import TaskSyncWorker
 from core.api_client import APIClient
 from tasks.classify.canvas import ImageCanvas
 
@@ -20,6 +21,7 @@ class ClassifyTaskScreen(QWidget):
         self.selected_label = None
         self.initial_label = None
         self.export_pending = None
+        self.sync_worker = None
         self.prompting_conflict = False
         self.history = []
         self.shortcuts = []
@@ -153,6 +155,9 @@ class ClassifyTaskScreen(QWidget):
         self.sync_timer.start(30000)
 
     def stop_and_back(self):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         if not self.confirm_switch():
             return
         self.sync_timer.stop()
@@ -161,34 +166,47 @@ class ClassifyTaskScreen(QWidget):
         self.on_back_callback()
 
     def manual_refresh(self):
-        try:
-            self.data_manager.scan_local_folder(self.task_type)
-            conflicts = self.data_manager.sync_task_state(self.task_type, self.current_task)
-            self.sync_data()
-            self.handle_conflicts(conflicts)
-            self.errors_button.setVisible(bool(self.data_manager.strategies[self.task_type].errors))
-            if self.current_task is None:
-                self.load_next_task()
-        except (requests.RequestException, OSError, ValueError) as error:
-            self.status_label.setText(f"Could not refresh: {error}")
+        self.start_sync(scan=True)
 
     def sync_data_timer(self):
-        try:
-            conflicts = self.data_manager.sync_task_state(self.task_type, self.current_task)
-            self.sync_data()
-            self.handle_conflicts(conflicts)
-            if self.current_task is None:
-                self.load_next_task()
-        except (requests.RequestException, ValueError) as error:
-            self.status_label.setText(f"Could not sync: {error}")
+        self.start_sync()
+
+    def start_sync(self, scan=False):
+        if self.sync_worker is not None or self.prompting_conflict:
+            return
+        worker = TaskSyncWorker(self.data_manager, self.task_type, self.current_task, scan, self)
+        self.sync_worker = worker
+        window = self.window()
+        window.installEventFilter(worker)
+
+        def finished():
+            window.removeEventFilter(worker)
+            self.sync_worker = None
+            if worker.error:
+                self.status_label.setText(worker.error)
+            else:
+                try:
+                    if worker.task is None:
+                        self.set_current_task(worker.next_task)
+                    self.sync_data()
+                    self.errors_button.setVisible(bool(self.data_manager.strategies[self.task_type].errors))
+                    self.handle_conflicts(worker.conflicts)
+                except (OSError, ValueError) as error:
+                    self.status_label.setText(str(error))
+            worker.deleteLater()
+
+        worker.finished.connect(finished)
+        worker.start()
 
     def sync_data(self):
-        done_tasks = self.data_manager.get_done_tasks(self.task_type)
-        processing_tasks = self.data_manager.get_processing_tasks(self.task_type)
+        done_tasks = self.data_manager.get_done_tasks(self.task_type, refresh=False)
+        processing_tasks = self.data_manager.get_processing_tasks(self.task_type, refresh=False)
         for widget, tasks in [(self.history_list, done_tasks), (self.processing_list, processing_tasks)]:
             widget.clear()
             for task in tasks:
                 label = f"[pending] {task['label']}" if task.get("pending_sync") else task["label"]
+                if task.get("expired"):
+                    label = f"[expired] {label}"
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, task)
                 widget.addItem(item)
@@ -247,6 +265,9 @@ class ClassifyTaskScreen(QWidget):
             raise ValueError("The AABB changed. Refresh inputs before classifying it.")
 
     def load_next_task(self):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         try:
             task = self.data_manager.get_free_task(self.task_type)
             self.set_current_task(task)
@@ -295,6 +316,9 @@ class ClassifyTaskScreen(QWidget):
         self.update_choice()
 
     def save_and_submit(self):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         if not self.current_task or self.selected_label not in ("handwriting", "sketch"):
             return
         task = self.current_task
@@ -331,7 +355,10 @@ class ClassifyTaskScreen(QWidget):
         return choice == QMessageBox.StandardButton.Discard
 
     def open_task(self, task, reopen=False):
-        if self.current_task and self.current_task["task_id"] == task["task_id"]:
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
+        if self.current_task and self.current_task["task_id"] == task["task_id"] and not task.get("expired"):
             return
         if not self.confirm_switch():
             return
@@ -348,9 +375,15 @@ class ClassifyTaskScreen(QWidget):
             QMessageBox.warning(self, "Classification", str(error))
 
     def on_processing_clicked(self, item):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         self.open_task(item.data(Qt.ItemDataRole.UserRole))
 
     def on_history_clicked(self, item):
+        if self.sync_worker is not None:
+            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
+            return
         self.open_task(item.data(Qt.ItemDataRole.UserRole), reopen=True)
 
     def showEvent(self, event):
