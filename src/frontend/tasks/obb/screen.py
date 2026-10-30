@@ -41,6 +41,7 @@ class OBBTaskScreen(QWidget):
 
         self.status_label = QLabel()
         self.status_label.setWordWrap(True)
+        self.canvas.message.connect(self.status_label.setText)
         right_panel.addWidget(self.status_label)
 
         lbl_processing = QLabel("Processing Tasks:")
@@ -224,6 +225,7 @@ class OBBTaskScreen(QWidget):
             existing_result = task.get("existing_result")
             if existing_result and "points" in existing_result:
                 self.canvas.load_existing_points(existing_result["points"])
+            self.canvas.setFocus()
         else:
             self.current_task = None
             self.canvas.show_empty_state()

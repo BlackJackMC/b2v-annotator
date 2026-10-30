@@ -1,7 +1,7 @@
 from typing import List, Dict
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem
-from PyQt6.QtCore import Qt, QPoint, QPointF
-from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter, QPolygonF, QPainterPath
+from PyQt6.QtCore import Qt, QPoint, QPointF, pyqtSignal
+from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter, QPolygonF, QPainterPath, QKeySequence
 
 class BoundingBox(QGraphicsRectItem):
     def __init__(self, x, y, w, h, canvas):
@@ -57,6 +57,13 @@ class BoundingBox(QGraphicsRectItem):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+                self.setSelected(not self.isSelected())
+                event.accept()
+                return
+            if not self.isSelected():
+                self.scene().clearSelection()
+                self.setSelected(True)
             edge = self.get_edge_at(event.pos())
             self.drag_start_pos = event.scenePos()
             self.original_rect = self.rect()
@@ -117,6 +124,8 @@ class BoundingBox(QGraphicsRectItem):
         super().mouseReleaseEvent(event)
 
 class ImageCanvas(QGraphicsView):
+    message = pyqtSignal(str)
+
     def __init__(self):
         super().__init__()
         self.scene = QGraphicsScene(self)
@@ -126,6 +135,10 @@ class ImageCanvas(QGraphicsView):
         self.is_editable = False
         self.crop_offset_x = 0
         self.crop_offset_y = 0
+        self.copied_boxes = []
+        self.copied_image_size = None
+        self.image_size = None
+        self.setToolTip("Ctrl+A: select all boxes. Ctrl+C: copy selection. Ctrl+V: paste at the original image coordinates.")
         
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
@@ -221,6 +234,25 @@ class ImageCanvas(QGraphicsView):
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event):
+        if not self.is_editable:
+            return super().keyPressEvent(event)
+        if event.matches(QKeySequence.StandardKey.SelectAll):
+            for box in self.boxes:
+                box.setSelected(True)
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Copy):
+            selected = [coords for box, coords in zip(self.boxes, self.get_coordinates()) if box.isSelected()]
+            if selected and not self._is_drawing:
+                self.copied_boxes = selected
+                self.copied_image_size = self.image_size
+                self.message.emit(f"Copied {len(selected)} boxes.")
+            event.accept()
+            return
+        if event.matches(QKeySequence.StandardKey.Paste):
+            self.paste_boxes()
+            event.accept()
+            return
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
             selected_items = self.scene.selectedItems()
             for item in selected_items:
@@ -230,8 +262,29 @@ class ImageCanvas(QGraphicsView):
             return
         super().keyPressEvent(event)
 
+    def paste_boxes(self):
+        if not self.copied_boxes or self._is_drawing:
+            return
+        if self.image_size != self.copied_image_size:
+            self.message.emit("Cannot paste: image dimensions differ. Coordinates were not changed.")
+            return
+        rect = self.image_item.boundingRect()
+        for box in self.copied_boxes:
+            x, y = box["x"] - self.crop_offset_x, box["y"] - self.crop_offset_y
+            if x < 0 or y < 0 or x + box["w"] > rect.width() or y + box["h"] > rect.height():
+                self.message.emit("Cannot paste: a box lies outside this crop. No boxes were added.")
+                return
+        self.scene.clearSelection()
+        for data in self.copied_boxes:
+            box = BoundingBox(data["x"] - self.crop_offset_x, data["y"] - self.crop_offset_y, data["w"], data["h"], self)
+            self.scene.addItem(box)
+            self.boxes.append(box)
+            box.setSelected(True)
+        self.message.emit(f"Pasted {len(self.copied_boxes)} boxes at their original image coordinates.")
+
     def show_empty_state(self):
         self.scene.clear()
+        self.image_item = None
         self.boxes.clear()
         self.is_editable = False
         self.crop_offset_x = 0
@@ -255,6 +308,7 @@ class ImageCanvas(QGraphicsView):
         self.crop_offset_y = 0
         
         pixmap = QPixmap(image_path)
+        self.image_size = (pixmap.width(), pixmap.height())
         
         if crop_coords and len(crop_coords) == 4:
             points = [QPointF(p["x"], p["y"]) for p in crop_coords]

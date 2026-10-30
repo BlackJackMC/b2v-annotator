@@ -482,6 +482,16 @@ class ImageCanvas(QGraphicsView):
         self.stroke_animation.setEndValue(QColor("#00b7ff"))
         self.stroke_animation.start()
 
+    def paste_strokes(self, strokes):
+        self.finish_drawing()
+        changes = []
+        for offset, source in enumerate(strokes):
+            stroke = copy.deepcopy(source)
+            stroke["id"] = uuid.uuid4().hex
+            changes.append((len(self.strokes) + offset, None, stroke))
+        if changes:
+            self.undo_stack.push(StrokeGroupCommand(self, changes, "Paste strokes"))
+
     def finish_drawing(self):
         if self.node_after is not None and self.selected_index >= 0:
             self.commit_node_move(self.strokes[self.selected_index])

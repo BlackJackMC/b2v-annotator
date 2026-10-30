@@ -146,6 +146,21 @@ class TraceService:
                 result[task["task_id"]] = task
         return result
 
+    def saved_tracing(self, task):
+        document = self.local_document(task)
+        if task["task_id"] not in self.pending_sync:
+            try:
+                status = self.check_status([task["task_id"]]).get(task["task_id"], {})
+                if status.get("result") is not None:
+                    document = compact_annotation(status["result"], task, self.user_id)
+            except OfflineSyncError:
+                if document is None:
+                    raise
+        if document is None:
+            raise ValueError("No saved tracing is available for this region.")
+        validate_annotation(document, task)
+        return {"task": task, "document": document}
+
     def refresh(self, scan=False):
         if scan:
             self.tasks = self.strategy.scan_local_folder(self.config)

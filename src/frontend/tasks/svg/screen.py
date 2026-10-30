@@ -2,8 +2,9 @@ import copy
 from html import escape
 import math
 from PyQt6 import sip
-from PyQt6.QtCore import Qt, QPointF, QTimer, QEvent, QSettings, QVariantAnimation, QEasingCurve
-from PyQt6.QtGui import QCursor, QImage, QKeySequence, QMouseEvent, QPixmap, QShortcut
+from PyQt6.QtCore import Qt, QPointF, QTimer, QEvent, QSettings, QVariantAnimation, QEasingCurve, QByteArray, QSize
+from PyQt6.QtGui import QCursor, QImage, QKeySequence, QMouseEvent, QPixmap, QShortcut, QPainter, QIcon
+from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QListWidget,
     QListWidgetItem, QComboBox, QDoubleSpinBox, QSlider,
@@ -11,7 +12,7 @@ from PyQt6.QtWidgets import (
     QCheckBox, QAbstractItemView, QDialog, QGridLayout
 )
 from tasks.svg.canvas import ImageCanvas
-from tasks.svg.document import canvas_strokes, stroke_data
+from tasks.svg.document import canvas_strokes, stroke_data, svg_text, validate_annotation
 from tasks.svg.service import TraceService, TaskWorker, LocalEditsConflict
 
 
@@ -33,6 +34,16 @@ class SVGTaskScreen(QWidget):
         self.loading = False
         self.dirty = False
         self.input_errors = []
+        self.saved_preview = None
+        self.copied_tracing = None
+        self.preview_task = None
+        self.preview_timer = QTimer(self)
+        self.preview_timer.setSingleShot(True)
+        self.preview_timer.timeout.connect(self.preview_saved_tracing)
+        self.history_icons = {}
+        self.thumbnail_timer = QTimer(self)
+        self.thumbnail_timer.setSingleShot(True)
+        self.thumbnail_timer.timeout.connect(self.load_history_thumbnail)
         self.shortcuts = []
         self.close_target = None
         self.settings = QSettings("board2vec", "annotator")
@@ -132,6 +143,7 @@ class SVGTaskScreen(QWidget):
         navigation.addWidget(self.refresh_button)
         right.addLayout(navigation)
         self.tabs = QTabWidget()
+        self.tabs.currentChanged.connect(lambda: self.thumbnail_timer.start(200))
         right.addWidget(self.tabs, stretch=1)
 
         regions = QWidget()
@@ -150,8 +162,22 @@ class SVGTaskScreen(QWidget):
         region_layout.addWidget(self.region_list, stretch=1)
         region_layout.addWidget(QLabel("Done"))
         self.history_list = QListWidget()
+        self.history_list.setIconSize(QSize(64, 44))
+        self.history_list.setUniformItemSizes(True)
+        self.history_list.verticalScrollBar().valueChanged.connect(lambda: self.thumbnail_timer.start(200))
         self.history_list.itemDoubleClicked.connect(self.on_region_clicked)
+        self.history_list.itemClicked.connect(self.schedule_saved_preview)
         region_layout.addWidget(self.history_list, stretch=1)
+        transfer = QHBoxLayout()
+        self.copy_trace_button = QPushButton("Copy strokes")
+        self.copy_trace_button.setEnabled(False)
+        self.copy_trace_button.clicked.connect(self.copy_saved_tracing)
+        self.paste_trace_button = QPushButton("Paste strokes")
+        self.paste_trace_button.setEnabled(False)
+        self.paste_trace_button.clicked.connect(self.paste_saved_tracing)
+        transfer.addWidget(self.copy_trace_button)
+        transfer.addWidget(self.paste_trace_button)
+        region_layout.addLayout(transfer)
         self.errors_button = QPushButton("Input details")
         self.errors_button.clicked.connect(self.show_input_errors)
         self.errors_button.hide()
@@ -285,6 +311,8 @@ class SVGTaskScreen(QWidget):
     def init_shortcuts(self):
         self.shortcut_actions = [
             ("Save", "Ctrl+S", self.save_and_submit, self),
+            ("Copy saved strokes", "Ctrl+C", self.copy_saved_tracing, self.history_list),
+            ("Paste strokes", "Ctrl+V", self.paste_saved_tracing, self.canvas),
             ("Undo", "Ctrl+Z", self.canvas.undo, self),
             ("Redo", "Ctrl+Shift+Z", self.canvas.redo, self),
             ("Delete", "Delete", self.canvas.delete_selected, self.canvas),
@@ -323,6 +351,8 @@ class SVGTaskScreen(QWidget):
         self.key_editors = {}
         self.shortcut_objects = {}
         self.shortcut_descriptions = {
+            "Copy saved strokes": "Copy the previewed done region without opening or claiming it.",
+            "Paste strokes": "Add copied strokes at their original image position. Undo removes the whole paste.",
             "Save": "Save JSON and SVG, then open the next region.",
             "Undo": "Undo a point or an edit; up to 200 completed edits per region.",
             "Redo": "Restore an undone point or edit.",
@@ -392,6 +422,7 @@ class SVGTaskScreen(QWidget):
         if self.tool_menu is not None:
             self.install_shortcuts(self.menu_shortcuts, self.tool_menu)
         buttons = {"Save": self.save_button, "Undo": self.undo_button, "Redo": self.redo_button,
+                   "Copy saved strokes": self.copy_trace_button, "Paste strokes": self.paste_trace_button,
                    "Fit": self.fit_button, "Focus canvas": self.focus_button, "Pan": self.pan_button,
                    "Delete": self.delete_button, "Simplify": self.simplify_button, **self.transform_buttons}
         for name, button in [*buttons.items(), *getattr(self, "menu_buttons", {}).items()]:
@@ -460,7 +491,7 @@ class SVGTaskScreen(QWidget):
             ("Edit", "Choose Select before editing existing strokes. Shift + click adds to selection. "
              "Width replaces the selected stroke width; Undo restores its previous profile. Eraser deletes on hover.",
              ["Select / nodes", "Select all", "Toggle nodes", "Stroke eraser", "Delete", "Undo", "Redo", "Simplify",
-              "Shrink selection", "Grow selection", "Rotate left", "Rotate right"]),
+              "Shrink selection", "Grow selection", "Rotate left", "Rotate right", "Copy saved strokes", "Paste strokes"]),
             ("View", "Hold Temporary pan and drag to move the image. Zoom and Fit do not change saved coordinates. "
              "Focus hides the sidebar and footer.",
              ["Temporary pan", "Pan", "Pan left", "Pan right", "Pan up", "Pan down", "Zoom in", "Zoom out", "Fit",
@@ -782,6 +813,8 @@ class SVGTaskScreen(QWidget):
         for widget in (self.back_button, self.refresh_button, self.next_button, self.region_list, self.history_list):
             widget.setEnabled(not busy and not pending)
         self.save_button.setEnabled(not busy and self.current_task is not None)
+        self.copy_trace_button.setEnabled(not busy and self.saved_preview is not None and bool(self.saved_preview["document"]["strokes"]))
+        self.paste_trace_button.setEnabled(not busy and not pending and self.current_task is not None and self.copied_tracing is not None)
         self.save_button.setText("Saving…" if self.saving else "Retry Save" if pending else "Save && Next")
         for widget in (self.canvas, self.tool_combo, self.undo_button, self.redo_button, self.pan_button,
                        self.delete_button, self.simplify_button, self.stroke_list, self.tabs, self.width_input, self.focus_button):
@@ -798,6 +831,7 @@ class SVGTaskScreen(QWidget):
 
     def manual_refresh(self):
         def refreshed(data):
+            self.history_icons.clear()
             self.update_regions(data)
             if self.current_task is None:
                 self.load_next_task()
@@ -817,6 +851,9 @@ class SVGTaskScreen(QWidget):
             item = QListWidgetItem(label)
             item.setData(Qt.ItemDataRole.UserRole, task)
             if status == "done":
+                item.setSizeHint(QSize(0, 52))
+                if task["task_id"] in self.history_icons:
+                    item.setIcon(self.history_icons[task["task_id"]])
                 self.history_list.addItem(item)
                 done += 1
             else:
@@ -831,6 +868,7 @@ class SVGTaskScreen(QWidget):
         suffix = f" · {len(self.input_errors)} input issues" if self.input_errors else ""
         mode = "" if self.service.online else " · Offline (local-first)"
         self.status_label.setText(f"{len(self.service.tasks)} regions{suffix}{mode}")
+        self.thumbnail_timer.start(200)
 
     def show_input_errors(self):
         box = QMessageBox(self)
@@ -871,11 +909,120 @@ class SVGTaskScreen(QWidget):
             self.dirty = bool(result and result["task"]["task_id"] in self.service.pending)
             self.next_button.setVisible(result is None)
             self.save_button.setEnabled(result is not None)
+            self.paste_trace_button.setEnabled(result is not None and self.copied_tracing is not None)
         finally:
             self.loading = False
 
     def on_region_clicked(self, item):
+        self.preview_timer.stop()
         self.open_region(item.data(Qt.ItemDataRole.UserRole))
+
+    def schedule_saved_preview(self, item):
+        self.thumbnail_timer.stop()
+        self.preview_task = item.data(Qt.ItemDataRole.UserRole)
+        self.saved_preview = None
+        self.copy_trace_button.setEnabled(False)
+        self.preview_timer.start(QApplication.doubleClickInterval())
+
+    def set_history_thumbnail(self, task, document):
+        image = QImage(64, 44, QImage.Format.Format_ARGB32_Premultiplied)
+        image.fill(Qt.GlobalColor.white)
+        renderer = QSvgRenderer(QByteArray(svg_text(document).encode("utf-8")))
+        painter = QPainter(image)
+        renderer.render(painter)
+        painter.end()
+        icon = QIcon(QPixmap.fromImage(image))
+        self.history_icons[task["task_id"]] = icon
+        if len(self.history_icons) > 64:
+            self.history_icons.pop(next(iter(self.history_icons)))
+        for row in range(self.history_list.count()):
+            item = self.history_list.item(row)
+            if item.data(Qt.ItemDataRole.UserRole)["task_id"] == task["task_id"]:
+                item.setIcon(icon)
+                break
+
+    def load_history_thumbnail(self):
+        if not self.history_list.isVisible():
+            return
+        if self.worker or self.preview_timer.isActive():
+            self.thumbnail_timer.start(300)
+            return
+        for row in range(self.history_list.count()):
+            item = self.history_list.item(row)
+            task = item.data(Qt.ItemDataRole.UserRole)
+            if task["task_id"] not in self.history_icons and self.history_list.visualItemRect(item).intersects(self.history_list.viewport().rect()):
+                def load():
+                    try:
+                        document = self.service.local_document(task)
+                        if document is not None:
+                            return {"task": task, "document": document}
+                        return self.service.saved_tracing(task)
+                    except (RuntimeError, OSError, ValueError) as error:
+                        return {"error": str(error)}
+
+                def loaded(result):
+                    if "error" in result:
+                        self.history_icons[task["task_id"]] = QIcon()
+                    else:
+                        self.set_history_thumbnail(task, result["document"])
+                    if len(self.history_icons) > 64:
+                        self.history_icons.pop(next(iter(self.history_icons)))
+                    self.thumbnail_timer.start(200)
+
+                self.run_job(load, loaded, "Loading thumbnails…", quiet=True)
+                return
+
+    def preview_saved_tracing(self):
+        if self.worker or self.preview_task is None:
+            return
+        task = self.preview_task
+        self.saved_preview = None
+        self.copy_trace_button.setEnabled(False)
+
+        def loaded(result):
+            self.saved_preview = result
+            document = result["document"]
+            self.set_history_thumbnail(task, document)
+            self.copy_trace_button.setEnabled(bool(document["strokes"]))
+            self.status_label.setText("Preview: " + task["label"] + ". Copy strokes to reuse them in the current region.")
+            self.thumbnail_timer.start(200)
+
+        self.run_job(lambda: self.service.saved_tracing(task), loaded, "Loading saved strokes…")
+
+    def copy_saved_tracing(self):
+        if self.worker or self.saved_preview is None:
+            return
+        self.copied_tracing = copy.deepcopy(self.saved_preview)
+        self.paste_trace_button.setEnabled(self.current_task is not None)
+        self.paste_trace_button.setToolTip(self.action_hint("Paste strokes") + " From " + self.copied_tracing["task"]["label"])
+        self.status_label.setText("Copied strokes from " + self.copied_tracing["task"]["label"])
+
+    def paste_saved_tracing(self):
+        if self.worker or self.current_task is None or self.copied_tracing is None or self.service.export_pending is not None:
+            return
+        source = self.copied_tracing["task"]["source"]
+        target = self.current_task["source"]
+        if source["image_size"] != target["image_size"]:
+            self.show_status("Image dimensions differ. Paste requires matching image sizes to preserve positions and widths.")
+            return
+        document = self.copied_tracing["document"]
+        strokes = canvas_strokes(document)
+        dx = document["crop"][0] - target["crop_xywh"][0]
+        dy = document["crop"][1] - target["crop_xywh"][1]
+        for stroke in strokes:
+            stroke["points"] = [[x + dx, y + dy] for x, y in stroke["points"]]
+        self.canvas.finish_drawing()
+        candidate = copy.deepcopy(self.document)
+        candidate["strokes"] = [stroke_data(stroke) for stroke in self.canvas.strokes + strokes]
+        try:
+            validate_annotation(candidate, self.current_task)
+        except ValueError as error:
+            self.show_status("Cannot paste without changing the tracing: " + str(error))
+            return
+        self.canvas.paste_strokes(strokes)
+        self.tool_combo.setCurrentIndex(2)
+        self.canvas.setFocus()
+        self.show_status(f"Pasted {len(strokes)} strokes at their original image position. Ctrl+Z undoes this paste.")
 
     def resolve_local_conflict(self, task):
         box = QMessageBox(self)
@@ -931,6 +1078,7 @@ class SVGTaskScreen(QWidget):
         task = self.current_task
 
         def saved(result):
+            self.history_icons.pop(task["task_id"], None)
             self.dirty = False
             self.set_current_task(result["next"])
             if result["error"]:
@@ -991,6 +1139,8 @@ class SVGTaskScreen(QWidget):
         self.canvas.fit_image()
 
     def hideEvent(self, event):
+        self.preview_timer.stop()
+        self.thumbnail_timer.stop()
         self.pointer_click(False)
         self.click_keys.clear()
         super().hideEvent(event)
