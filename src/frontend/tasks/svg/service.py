@@ -75,6 +75,9 @@ class TraceService:
         self.session = None
         self.source_image = None
         self.source_key = None
+        self.active_saves = set()
+        self.claiming_task_ids = set()
+        self.committed_saves = set()
         self.online = True
         self.last_export_warning = ""
         self.load_pending_queue()
@@ -290,6 +293,29 @@ class TraceService:
         except (OSError, ValueError, TypeError, KeyError):
             return None
 
+    def cleanup_available_json(self, task):
+        """Delete only validated stale JSON; never delete pending/in-flight work."""
+        tid = task["task_id"]
+        with self._lock:
+            if (self.statuses.get(tid, {}).get("status") != "available"
+                    or tid in self.active_saves or tid in self.committed_saves
+                    or tid in self.pending_sync
+                    or tid in self.pending or tid in self.claimed_task_ids
+                    or tid in self.claiming_task_ids
+                    or self.export_pending is not None):
+                return False
+            output = Path(task["output_path"])
+            if not output.is_file():
+                return False
+            try:
+                raw = json.loads(output.read_bytes())
+                document = compact_annotation(raw, task, self.user_id)
+                validate_annotation(document, task)
+            except (OSError, ValueError, TypeError, KeyError):
+                return False
+            output.unlink()
+            return True
+
     def check_status(self, task_ids, include_results=True):
 
         result = {}
@@ -334,9 +360,10 @@ class TraceService:
         with self._lock:
             for tid in self.pending_sync:
                 self.statuses[tid] = {
-                    "status": "done",
+                    "status": "unknown",
                     "locked_by": None,
                     "has_result": True,
+                    "status_unverified": True,
                     "pending_sync": True,
                 }
 
@@ -348,18 +375,25 @@ class TraceService:
             snapshot = list(self.tasks)
         try:
             remote = self.check_status([t["task_id"] for t in snapshot], include_results=False)
+            # The original backend does not return rows for unclaimed task IDs.
+            remote = {**{t["task_id"]: {"task_id": t["task_id"], "status": "available",
+                                            "locked_by": None} for t in snapshot}, **remote}
             with self._lock:
                 self.statuses = remote
-                self.claimed_task_ids.intersection_update({
-                    tid for tid, st in remote.items()
-                    if st.get("status") == "processing" and st.get("locked_by") == self.user_id
-                })
+                # Do not erase this process's known claims from a status snapshot:
+                # a concurrent /claim may have succeeded after the snapshot.
+                # Renew/unclaim/submit explicitly resolve ownership instead.
+            for task in snapshot:
+                if remote.get(task["task_id"], {}).get("status") == "available":
+                    self.cleanup_available_json(task)
         except OfflineSyncError:
+            # Offline is UNKNOWN, not Done even if a previous export exists.
+            # Also prevent stale cached Available entries from Auto Next.
             with self._lock:
                 for task in snapshot:
                     tid = task["task_id"]
-                    if tid not in self.statuses and Path(task["output_path"]).is_file():
-                        self.statuses[tid] = {"status": "done", "locked_by": None}
+                    self.statuses[tid] = {"task_id": tid, "status": "unknown",
+                                          "locked_by": None, "status_unverified": True}
         self._apply_pending_overlay()
         with self._lock:
             return {"tasks": list(self.tasks), "statuses": dict(self.statuses),
@@ -886,6 +920,15 @@ class TraceService:
     def refresh_local_scan(self):
         """Disk-only scanning. Call from the file lane, never the Qt UI thread."""
         scanned = self.strategy.scan_local_folder(self.config)
+        destinations = {}
+        for task in scanned:
+            output = task.get("output_path")
+            if not output:
+                continue
+            key = str(Path(output).resolve()).casefold() if os.name == "nt" else str(Path(output).resolve())
+            old = destinations.setdefault(key, task["task_id"])
+            if old != task["task_id"]:
+                raise ValueError(f"Output JSON collision: {output} belongs to {old} and {task['task_id']}")
         with self._lock:
             self.tasks = scanned
         return len(scanned)
@@ -906,7 +949,18 @@ class TraceService:
         export_submitted() on file lane; errors preserve their snapshot there.
         """
         tid = task["task_id"]
-        self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": result})
+        try:
+            self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": result})
+        except (OfflineSyncError, TaskConflict) as original:
+            # An accepted commit can lose its response. Query the authoritative
+            # saved payload; do not retry a possibly successful write blindly.
+            try:
+                remote = self.check_status([tid], include_results=True).get(tid)
+            except OfflineSyncError:
+                raise original
+            if not (remote and remote.get("status") == "done"
+                    and remote.get("result") == result):
+                raise original
         return result
 
 

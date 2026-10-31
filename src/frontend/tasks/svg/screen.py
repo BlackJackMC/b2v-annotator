@@ -30,8 +30,10 @@ class SVGTaskScreen(QWidget):
         self.crop_image = None
         self.worker = None
         self.network_lane = BackgroundLane(self)
+        self.claim_lane = BackgroundLane(self)
         self.file_lane = BackgroundLane(self)
         self.network_lane.completed.connect(self._background_completed)
+        self.claim_lane.completed.connect(self._background_completed)
         self.file_lane.completed.connect(self._background_completed)
         self._background_callbacks = {}
         self._next_job_id = 0
@@ -42,6 +44,7 @@ class SVGTaskScreen(QWidget):
         self._saving_tasks = {}
         self._task_items = {}
         self.network_lane.start()
+        self.claim_lane.start()
         self.file_lane.start()
         self.busy = False
         self.job_blocking = False
@@ -864,13 +867,16 @@ class SVGTaskScreen(QWidget):
 
 
     def start_task(self):
-        # The same SVG screen may be reused after Back; recreate its two lanes.
+        # A reused screen must recreate all three stopped lanes.
         if self.network_lane._stopping:
             self.network_lane = BackgroundLane(self)
+            self.claim_lane = BackgroundLane(self)
             self.file_lane = BackgroundLane(self)
             self.network_lane.completed.connect(self._background_completed)
+            self.claim_lane.completed.connect(self._background_completed)
             self.file_lane.completed.connect(self._background_completed)
             self.network_lane.start()
+            self.claim_lane.start()
             self.file_lane.start()
         self.sync_timer.start(30000)
         self.manual_refresh()
@@ -947,22 +953,23 @@ class SVGTaskScreen(QWidget):
         box.setDetailedText("\n".join(self.input_errors))
         box.exec()
 
-    def load_next_task(self, after_task_id=None):
+    def load_next_task(self, after_task_id=None, skipped=None):
         # Claim only a selected/next region, never on Refresh.
+        skipped = skipped or set()
         tasks = list(self.service.tasks)
         start = next((i for i, t in enumerate(tasks) if t["task_id"] == after_task_id), -1)
         for task in tasks[start + 1:] + tasks[:max(0, start)]:
             tid = task["task_id"]
-            if tid in self._saving_tasks:
+            if tid in skipped or tid in self._saving_tasks or tid in self._claiming_ids:
                 continue
             st = self.service.statuses.get(tid, {})
-            if st.get("status") == "done":
+            if st.get("status") not in ("available", "expired", "processing"):
                 continue
             if st.get("status") == "processing" and st.get("locked_by") != self.service.user_id:
                 continue
-            self.open_region(task)
+            self.open_region(task, auto_next=True, skipped=skipped)
             return
-        self.show_status("No currently available task.")
+        self.show_status("No verified available task.")
 
 
     def set_current_task(self, result):
@@ -1147,7 +1154,7 @@ class SVGTaskScreen(QWidget):
             use_local = box.clickedButton() is local
             QTimer.singleShot(0, lambda: self.open_region(task, use_local))
 
-    def open_region(self, task, use_local=None):
+    def open_region(self, task, use_local=None, auto_next=False, skipped=None):
         """Click -> network claim -> file decode -> GUI render. Clicks never
         release previously claimed tasks; they stay held until submit/exit/TTL.
         Multiple rapid clicks claim every task but only DISPLAY the latest one.
@@ -1176,11 +1183,26 @@ class SVGTaskScreen(QWidget):
             self.document = None
             self.dirty = False
         self._claiming_ids.add(tid)
+        with self.service._lock:
+            self.service.claiming_task_ids.add(tid)
         self._update_task_row(tid)
         self.show_status(f"Claiming {task['label']} on MongoDB…")
 
         def claimed(reply):
+            if auto_next and reply.get("_auto_skip"):
+                self._claiming_ids.discard(tid)
+                with self.service._lock:
+                    self.service.claiming_task_ids.discard(tid)
+                    if reply.get("_auto_status") == "done":
+                        self.service.statuses[tid] = {"task_id": tid, "status": "done",
+                                                      "locked_by": None, "has_result": True}
+                self._update_task_row(tid)
+                if serial == self._open_serial:
+                    self.load_next_task(after_task_id=tid, skipped=(skipped or set()) | {tid})
+                return
             self._claiming_ids.discard(tid)
+            with self.service._lock:
+                self.service.claiming_task_ids.discard(tid)
             # The DB has acknowledged ownership. Update this row immediately.
             self._claimed_tasks[tid] = dict(task)
             self._update_task_row(tid)
@@ -1201,9 +1223,27 @@ class SVGTaskScreen(QWidget):
 
         def claim_failed(error):
             self._claiming_ids.discard(tid)
+            with self.service._lock:
+                self.service.claiming_task_ids.discard(tid)
             self._update_task_row(tid)
             self._background_error(error)
-        self._enqueue("network", lambda: self.service.claim(task), claimed, claim_failed, priority=0)
+        def verified_claim():
+            if auto_next:
+                rows = self.service.check_status([tid], include_results=True)
+                state = rows.get(tid)
+                if state and state.get("status") == "done":
+                    return {"_auto_skip": True, "_auto_status": "done"}
+                if state and state.get("result") is not None:
+                    return {"_auto_skip": True, "_auto_status": state.get("status")}
+                if state and state.get("status") == "processing" and state.get("locked_by") != self.service.user_id:
+                    return {"_auto_skip": True, "_auto_status": "processing"}
+            reply = self.service.claim(task)
+            if auto_next and reply.get("existing_result") is not None:
+                # The backend may allow claim of a newly completed task.
+                self.service.release(task)
+                return {"_auto_skip": True, "_auto_status": "done"}
+            return reply
+        self._enqueue("claim", verified_claim, claimed, claim_failed, priority=0)
 
 
     def start_background_sync(self):
@@ -1247,6 +1287,8 @@ class SVGTaskScreen(QWidget):
         self.canvas.finish_drawing()
         snapshot = self.snapshot()  # Qt objects may only be read from UI thread
         self._saving_tasks[tid] = {"task": task, "snapshot": snapshot}
+        with self.service._lock:
+            self.service.active_saves.add(tid)
         self._update_task_row(tid)
         self._open_serial += 1  # invalidate any older image-load callback
         self.current_task = None
@@ -1277,16 +1319,24 @@ class SVGTaskScreen(QWidget):
 
         def prepared(result):
             def committed(saved):
+                with self.service._lock:
+                    self.service.committed_saves.add(tid)
                 self.service.statuses[tid] = {"status": "done", "locked_by": None, "has_result": True}
                 self._claimed_tasks.pop(tid, None)
                 self.history_icons.pop(tid, None)
                 self._saving_tasks.pop(tid, None)
                 self._update_task_row(tid)
                 self.show_status(f"Saved {task['label']} on server; exporting SVG/JSON in background.")
+                def export_ok(_):
+                    with self.service._lock:
+                        self.service.active_saves.discard(tid)
+                    self.show_status(f"Saved {task['label']} on server and exported locally.")
+                def export_error(exc):
+                    with self.service._lock:
+                        self.service.active_saves.discard(tid)
+                    self.show_status(f"Saved {task['label']} on server, but local export failed: {exc}")
                 self._enqueue("file", lambda: self.service.export_submitted(task, saved),
-                              lambda _: self.show_status(f"Saved {task['label']} on server and exported locally."),
-                              lambda exc: self.show_status(
-                                  f"Saved {task['label']} on server, but local export failed: {exc}"))
+                              export_ok, export_error)
             self._enqueue("network", lambda: self.service.submit_remote(task, result), committed, failed, priority=0)
         self._enqueue("file", lambda: self.service.prepare_submission(task, snapshot), prepared, failed, priority=0)
         # Auto-open the adjacent available region while A saves in background.
@@ -1465,7 +1515,9 @@ class SVGTaskScreen(QWidget):
         self._next_job_id += 1
         job_id = self._next_job_id
         self._background_callbacks[job_id] = (on_success, on_error)
-        (self.network_lane if lane == "network" else self.file_lane).submit(job_id, function, priority)
+        worker = (self.claim_lane if lane == "claim" else
+                  self.network_lane if lane == "network" else self.file_lane)
+        worker.submit(job_id, function, priority)
         return job_id
 
 
@@ -1547,6 +1599,8 @@ class SVGTaskScreen(QWidget):
 
 
     def _save_failed_finished(self, tid, error):
+        with self.service._lock:
+            self.service.active_saves.discard(tid)
         self._saving_tasks.pop(tid, None)
         self._update_task_row(tid)
         self.show_status(f"Save failed; local snapshot preserved for retry: {error}")
@@ -1556,8 +1610,10 @@ class SVGTaskScreen(QWidget):
 
     def _finish_background_lanes(self):
         self.network_lane.stop_after_jobs()
+        self.claim_lane.stop_after_jobs()
         self.file_lane.stop_after_jobs()
         # No user-facing jobs remain; stop the dedicated queues cleanly.
         self.network_lane.wait()
+        self.claim_lane.wait()
         self.file_lane.wait()
 
