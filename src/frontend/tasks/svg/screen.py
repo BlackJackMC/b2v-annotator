@@ -15,6 +15,8 @@ from PyQt6.QtWidgets import (
 from tasks.svg.canvas import ImageCanvas
 from tasks.svg.document import canvas_strokes, stroke_data, svg_text, validate_annotation
 from tasks.svg.service import TraceService, TaskWorker, LocalEditsConflict, TaskConflict
+from tasks.svg.background import BackgroundLane
+from PyQt6.QtCore import pyqtSlot
 
 
 class SVGTaskScreen(QWidget):
@@ -27,9 +29,25 @@ class SVGTaskScreen(QWidget):
         self.document = None
         self.crop_image = None
         self.worker = None
+        self.network_lane = BackgroundLane(self)
+        self.file_lane = BackgroundLane(self)
+        self.network_lane.completed.connect(self._background_completed)
+        self.file_lane.completed.connect(self._background_completed)
+        self._background_callbacks = {}
+        self._next_job_id = 0
+        self._open_serial = 0
+        self._claimed_tasks = {}
+        self._claiming_ids = set()
+        self._renew_inflight = set()
+        self._saving_tasks = {}
+        self._task_items = {}
+        self.network_lane.start()
+        self.file_lane.start()
         self.busy = False
         self.job_blocking = False
         self.save_requested = False
+        self.sync_requested = False
+        self.pending_open_region = None
         self.acknowledged_conflicts = set()
         self.last_interaction_at = time.monotonic()
         self.saving = False
@@ -786,7 +804,8 @@ class SVGTaskScreen(QWidget):
         if not quiet:
             self.status_label.setText(message)
         self.job_blocking = block
-        self.set_busy(True, block)
+        if not quiet:
+            self.set_busy(True, block)
         worker = TaskWorker(function, self)
         self.worker = worker
 
@@ -794,7 +813,8 @@ class SVGTaskScreen(QWidget):
             self.worker = None
             self.job_blocking = False
             self.saving = False
-            self.set_busy(False, block)
+            if not quiet:
+                self.set_busy(False, block)
             if worker.error:
                 if isinstance(worker.exception, TaskConflict):
                     # A different user may have claimed it after our last refresh.
@@ -821,6 +841,7 @@ class SVGTaskScreen(QWidget):
         worker.start()
         return True
 
+
     def set_busy(self, busy, block):
         self.busy = busy
         self.job_blocking = block if busy else False
@@ -841,66 +862,83 @@ class SVGTaskScreen(QWidget):
         if blocked and self.tool_menu is not None and self.tool_menu.isVisible():
             self.tool_menu.close()
 
+
     def start_task(self):
+        # The same SVG screen may be reused after Back; recreate its two lanes.
+        if self.network_lane._stopping:
+            self.network_lane = BackgroundLane(self)
+            self.file_lane = BackgroundLane(self)
+            self.network_lane.completed.connect(self._background_completed)
+            self.file_lane.completed.connect(self._background_completed)
+            self.network_lane.start()
+            self.file_lane.start()
         self.sync_timer.start(30000)
         self.manual_refresh()
 
+
     def refresh_statuses_only(self):
-        """Refresh visible lock labels without automatically claiming any task."""
-        if not self.worker:
-            self.run_job(self.service.refresh, self.update_regions,
-                         "Checking task ownership…", quiet=True)
+        self._enqueue("network", lambda: self.service.refresh(scan=False),
+                      self.update_regions, self._background_error)
+
 
     def manual_refresh(self):
-        # Listing regions is read-only. Merely opening the Regions page or
-        # pressing Refresh must NEVER claim a task without a click.
-        def refreshed(data):
-            self.history_icons.clear()
-            self.update_regions(data)
-        self.run_job(lambda: self.service.refresh(scan=True), refreshed, "Scanning AABB regions and checking status…")
+        # Scanner is DISK I/O; status fetch is NETWORK I/O. No auto-claim.
+        self.show_status("Scanning input regions in background…")
+        def scan_done(_):
+            self._enqueue("network", lambda: self.service.refresh(scan=False),
+                          self.update_regions, self._background_error, priority=5)
+        self._enqueue("file", lambda: self.service.refresh_local_scan(),
+                      scan_done, self._background_error)
+
 
     def update_regions(self, data=None):
+        ids = tuple(task["task_id"] for task in self.service.tasks)
+        if getattr(self, "_rendered_task_ids", None) == ids:
+            # Status-only refresh: preserve existing QListWidgetItem instances.
+            for task in self.service.tasks:
+                self._update_task_row(task["task_id"], update_progress=False)
+            self.progress_label.setText(
+                f"Done: {self.history_list.count()} / {len(self.service.tasks)}"
+                + (f" ({len(self.service.pending_sync)} pending sync)" if self.service.pending_sync else ""))
+            self.input_errors = list(self.service.strategy.errors)
+            self.errors_button.setVisible(bool(self.input_errors))
+            return
+        self._rendered_task_ids = ids
         self.region_list.setUpdatesEnabled(False)
         self.history_list.setUpdatesEnabled(False)
-        self.region_list.clear()
-        self.history_list.clear()
-        done = 0
-        for task in self.service.tasks:
-            st = self.service.statuses.get(task["task_id"], {})
-            status = st.get("status", "available")
-            if status == "done":
-                label = f"[pending] {task['label']}" if st.get("pending_sync") else task["label"]
-            elif status == "expired":
-                label = f"[expired — claim] {task['label']}"
-            elif status == "processing" and st.get("locked_by") == self.service.user_id:
-                label = f"[claimed by you] {task['label']}"
-            elif status == "processing":
-                label = f"[claimed by another annotator] {task['label']}"
-            else:
-                label = f"[{status}] {task['label']}"
-            item = QListWidgetItem(label)
-            item.setData(Qt.ItemDataRole.UserRole, task)
-            if status == "done":
-                item.setSizeHint(QSize(0, 52))
-                if task["task_id"] in self.history_icons:
-                    item.setIcon(self.history_icons[task["task_id"]])
-                self.history_list.addItem(item)
-                done += 1
-            else:
-                self.region_list.addItem(item)
-            if self.current_task and task["task_id"] == self.current_task["task_id"]:
-                item.setSelected(True)
-        self.region_list.setUpdatesEnabled(True)
-        self.history_list.setUpdatesEnabled(True)
-        pending_count = len(self.service.pending_sync)
-        pending_text = f" ({pending_count} pending sync)" if pending_count else ""
-        self.progress_label.setText(f"Done: {done} / {len(self.service.tasks)}{pending_text}")
+        try:
+            self.region_list.clear()
+            self.history_list.clear()
+            self._task_items.clear()
+            for task in self.service.tasks:
+                tid = task["task_id"]
+                item = QListWidgetItem(self._label_for(task))
+                item.setData(Qt.ItemDataRole.UserRole, task)
+                status = self.service.statuses.get(tid, {}).get("status")
+                if status == "done" and tid not in self._saving_tasks:
+                    item.setSizeHint(QSize(0, 52))
+                    if tid in self.history_icons:
+                        item.setIcon(self.history_icons[tid])
+                    self.history_list.addItem(item)
+                else:
+                    self.region_list.addItem(item)
+                self._task_items[tid] = item
+                if self.current_task and tid == self.current_task["task_id"]:
+                    item.setSelected(True)
+        finally:
+            self.region_list.setUpdatesEnabled(True)
+            self.history_list.setUpdatesEnabled(True)
+        self.progress_label.setText(
+            f"Done: {self.history_list.count()} / {len(self.service.tasks)}"
+            + (f" ({len(self.service.pending_sync)} pending sync)" if self.service.pending_sync else "")
+        )
         self.input_errors = list(self.service.strategy.errors)
         self.errors_button.setVisible(bool(self.input_errors))
         suffix = f" · {len(self.input_errors)} input issues" if self.input_errors else ""
         mode = "" if self.service.online else " · Offline (local-first)"
         self.status_label.setText(f"{len(self.service.tasks)} regions{suffix}{mode}")
         self.thumbnail_timer.start(200)
+
 
     def show_input_errors(self):
         box = QMessageBox(self)
@@ -909,11 +947,23 @@ class SVGTaskScreen(QWidget):
         box.setDetailedText("\n".join(self.input_errors))
         box.exec()
 
-    def load_next_task(self):
-        if self.current_task:
-            self.status_label.setText("Save this region first, or click another region. Unsaved edits stay in memory when switching.")
+    def load_next_task(self, after_task_id=None):
+        # Claim only a selected/next region, never on Refresh.
+        tasks = list(self.service.tasks)
+        start = next((i for i, t in enumerate(tasks) if t["task_id"] == after_task_id), -1)
+        for task in tasks[start + 1:] + tasks[:max(0, start)]:
+            tid = task["task_id"]
+            if tid in self._saving_tasks:
+                continue
+            st = self.service.statuses.get(tid, {})
+            if st.get("status") == "done":
+                continue
+            if st.get("status") == "processing" and st.get("locked_by") != self.service.user_id:
+                continue
+            self.open_region(task)
             return
-        self.run_job(self.service.next_region, self.set_current_task, "Claiming the next available region…", block=True)
+        self.show_status("No currently available task.")
+
 
     def set_current_task(self, result):
         self.loading = True
@@ -1085,98 +1135,217 @@ class SVGTaskScreen(QWidget):
         self.show_status(f"Pasted {len(strokes)} strokes at their original image position. Ctrl+Z undoes this paste.")
 
     def resolve_local_conflict(self, task):
-        self.show_status("Task was taken or the lock expired. Your previous edits cannot be submitted.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Saved result changed")
+        box.setText("This region has a newer server result. Choose which drawing to open. Keeping local edits will replace the server result only when you save.")
+        local = box.addButton("Keep local edits", QMessageBox.ButtonRole.AcceptRole)
+        server = box.addButton("Use server result", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() in (local, server):
+            use_local = box.clickedButton() is local
+            QTimer.singleShot(0, lambda: self.open_region(task, use_local))
 
     def open_region(self, task, use_local=None):
-        if self.worker or self.service.export_pending is not None:
+        """Click -> network claim -> file decode -> GUI render. Clicks never
+        release previously claimed tasks; they stay held until submit/exit/TTL.
+        Multiple rapid clicks claim every task but only DISPLAY the latest one.
+        """
+        if not task:
             return
-        if (self.current_task and self.current_task["task_id"] == task["task_id"] and use_local is None
-                and self.service.statuses.get(task["task_id"], {}).get("status") == "processing"
-                and self.service.statuses.get(task["task_id"], {}).get("locked_by") == self.service.user_id):
+        tid = task["task_id"]
+        if tid in self._saving_tasks:
+            self.show_status("This region is still saving. You can open another one.")
             return
-        self.canvas.finish_drawing()
-        previous = self.current_task
-        document = self.snapshot() if previous else None
+        if self.current_task and tid == self.current_task["task_id"]:
+            return
+        self._open_serial += 1
+        serial = self._open_serial
+        self.last_interaction_at = time.monotonic()
+        self.preview_timer.stop()
+        if self.current_task:
+            self.canvas.finish_drawing()
+            old_task = self.current_task
+            if self.dirty:
+                old_doc = self.snapshot()
+                # Serial FILE lane safely persists the previous in-progress draft.
+                self._enqueue("file", lambda t=old_task, d=old_doc: self.service.remember(t, d),
+                              lambda _: None, self._background_error)
+            self.current_task = None
+            self.document = None
+            self.dirty = False
+        self._claiming_ids.add(tid)
+        self._update_task_row(tid)
+        self.show_status(f"Claiming {task['label']} on MongoDB…")
 
-        def switch():
-            if previous:
-                self.service.remember(previous, document)
-            result = self.service.load_region(task, use_local=use_local)
-            # Keep ALL previously clicked tasks claimed in MongoDB.
-            # Switching the canvas must not unclaim the previous region.
-            return result
+        def claimed(reply):
+            self._claiming_ids.discard(tid)
+            # The DB has acknowledged ownership. Update this row immediately.
+            self._claimed_tasks[tid] = dict(task)
+            self._update_task_row(tid)
+            if serial != self._open_serial:
+                return  # This click was also registered; show the newest click.
+            def local_loaded(result):
+                if serial == self._open_serial:
+                    self.set_current_task(result)
+            def local_error(error):
+                self._background_error(error)
+                # Source read failed: release acquired lease in NETWORK lane.
+                if tid in self._claimed_tasks:
+                    self._claimed_tasks.pop(tid, None)
+                    self._enqueue("network", lambda: self.service.release(task),
+                                  lambda _: self._update_task_row(tid), self._background_error)
+            self._enqueue("file", lambda: self.service.load_claimed_region(task, reply),
+                          local_loaded, local_error)
 
-        self.run_job(switch, self.set_current_task, "Claiming region on server…", block=True)
+        def claim_failed(error):
+            self._claiming_ids.discard(tid)
+            self._update_task_row(tid)
+            self._background_error(error)
+        self._enqueue("network", lambda: self.service.claim(task), claimed, claim_failed, priority=0)
+
+
+    def start_background_sync(self):
+        if self.worker:
+            self.sync_requested = True
+            return
+        self.sync_requested = False
+        target_task = self.current_task
+
+        def synced(result):
+            self.update_regions()
+            if isinstance(result, dict) and result.get("active_locked"):
+                if self.current_task and target_task and self.current_task["task_id"] == target_task["task_id"] and not self.dirty:
+                    next_res = self.service.next_region_local()
+                    self.set_current_task(next_res)
+                    if next_res:
+                        self.start_background_sync()
+                self.show_status(result["active_locked"])
+
+        self.run_job(
+            lambda: self.service.sync_lock(target_task),
+            synced,
+            "Syncing with server…",
+            block=False,
+            quiet=True,
+        )
 
     def save_and_submit(self):
-        if not self.current_task:
+        """Snapshot now, send/validate/export on two lanes, continue with B.
+
+        DB commit completes BEFORE local export. No active canvas is mutated by
+        background work; task identity lives in each immutable save context.
+        """
+        if self.current_task is None:
             return
-        if self.worker:
-            if not self.job_blocking:
-                self.save_requested = True
-                self.status_label.setText("Save queued until the current server request finishes.")
+        task = dict(self.current_task)
+        tid = task["task_id"]
+        if tid in self._saving_tasks:
+            self.show_status("This region is already saving.")
             return
         self.canvas.finish_drawing()
-        document = self.snapshot()
-        if self.crop_image is None:
-            QMessageBox.warning(self, "Tracing", "No crop image is loaded.")
-            return
-        task = self.current_task
-        def saved(result):
-            if not result["saved"]:
-                # Save did not complete: retain current task, drawing and local draft.
-                self.show_status(result.get("error", "Save not completed. Local drawing preserved."))
-                return
-            self.history_icons.pop(task["task_id"], None)
-            self.dirty = False
-            self.set_current_task(result["next"])
-            if result["error"]:
-                self.status_label.setText("Saved locally. Could not open the next region: " + result["error"])
+        snapshot = self.snapshot()  # Qt objects may only be read from UI thread
+        self._saving_tasks[tid] = {"task": task, "snapshot": snapshot}
+        self._update_task_row(tid)
+        self._open_serial += 1  # invalidate any older image-load callback
+        self.current_task = None
+        self.document = None
+        self.dirty = False
+        # Reset canvas immediately, so there is no accidental editing of A
+        # while a snapshot for A is being committed. User can click B now.
+        self.loading = True
+        try:
+            self.saved_preview = None
+            self.crop_image = None
+            self.context_label.clear()
+            self.canvas.show_empty_state()
+            self.region_label.setText("Choose another region")
+            self.copy_trace_button.setEnabled(False)
+            self.paste_trace_button.setEnabled(False)
+            self.save_button.setEnabled(False)
+        finally:
+            self.loading = False
+        self.show_status(f"Saving {task['label']} in background. You can open another region.")
 
-        def submit():
-            try:
-                self.service.submit(task, document)
-            except LocalEditsConflict as error:
-                return {"saved": False, "next": None, "error": str(error), "conflict": error.task}
-            # Other exceptions are handled by run_job and leave the screen intact.
-            try:
-                return {"saved": True, "next": None, "error": "", "conflict": None}
-            except Exception as error:
-                return {"saved": True, "next": None, "error": str(error), "conflict": None}
+        def failed(error):
+            # Persist the frozen unsaved data; do not silently discard it.
+            self._enqueue("file", lambda: self.service.preserve_failed_save(task, snapshot),
+                          lambda _: self._save_failed_finished(tid, error),
+                          lambda backup_error: self._save_failed_finished(tid, RuntimeError(
+                              f"{error}; ALSO failed to persist local recovery: {backup_error}")))
 
-        self.saving = True
-        self.run_job(submit, saved, "Saving JSON and SVG…", block=True)
+        def prepared(result):
+            def committed(saved):
+                self.service.statuses[tid] = {"status": "done", "locked_by": None, "has_result": True}
+                self._claimed_tasks.pop(tid, None)
+                self.history_icons.pop(tid, None)
+                self._saving_tasks.pop(tid, None)
+                self._update_task_row(tid)
+                self.show_status(f"Saved {task['label']} on server; exporting SVG/JSON in background.")
+                self._enqueue("file", lambda: self.service.export_submitted(task, saved),
+                              lambda _: self.show_status(f"Saved {task['label']} on server and exported locally."),
+                              lambda exc: self.show_status(
+                                  f"Saved {task['label']} on server, but local export failed: {exc}"))
+            self._enqueue("network", lambda: self.service.submit_remote(task, result), committed, failed, priority=0)
+        self._enqueue("file", lambda: self.service.prepare_submission(task, snapshot), prepared, failed, priority=0)
+        # Auto-open the adjacent available region while A saves in background.
+        self.load_next_task(after_task_id=tid)
+
 
     def renew_lock(self):
-        if self.worker or self.service.export_pending is not None:
+        if time.monotonic() - self.last_interaction_at > 300:
+            return  # AFK: let existing leases expire on server
+        ids = [tid for tid in self._claimed_tasks
+               if tid not in self._saving_tasks and tid not in self._claiming_ids]
+        if not ids:
             return
-        # Keep all clicked tasks leased while this screen is running.
-        # Do not silently drop previously claimed tasks after 5 minutes.
-        if not self.service.claimed_task_ids:
-            self.run_job(self.service.refresh, self.update_regions, "Checking connection…", quiet=True)
+        if self._renew_inflight:
             return
-        self.run_job(self.service.sync_lock, lambda result: self.update_regions(),
-                     "Renewing claimed task locks…", quiet=True)
+        self._renew_inflight.update(ids)
+        def renewed(renewed_ids):
+            self._renew_inflight.difference_update(ids)
+            for tid in set(ids) - set(renewed_ids):
+                self._claimed_tasks.pop(tid, None)
+                self._update_task_row(tid)
+            if set(ids) - set(renewed_ids):
+                self.refresh_statuses_only()
+        def failed(error):
+            self._renew_inflight.difference_update(ids)
+            self.show_status("Lease renewal error: " + str(error))
+        self._enqueue("network", lambda: self.service.renew_tasks(ids),
+                      renewed, failed, priority=20)
+
 
     def stop_and_back(self):
-        if self.worker or self.service.export_pending is not None:
+        if self.worker or self._saving_tasks or self._background_callbacks:
+            self.show_status("Background requests/saves are still running. Try Back after they finish.")
             return
-        self.canvas.finish_drawing()
+        self._open_serial += 1
+        held = tuple(self._claimed_tasks.values())
+        self._claimed_tasks.clear()
         task = self.current_task
-        document = self.snapshot() if task else None
-
-        def release():
-            # Do not unclaim previously clicked tasks when leaving this screen.
-            # They remain server-owned until submitted, explicitly released,
-            # or the lease expires.
+        document = None
+        if task and self.dirty:
+            self.canvas.finish_drawing()
+            document = self.snapshot()
+        def release_all():
+            for claimed_task in held:
+                self.service.release(claimed_task)
             self.service.close()
-
-        def finished(result):
+        def left(_):
             self.sync_timer.stop()
             self.set_current_task(None)
+            self._finish_background_lanes()
             self.on_back_callback()
+        def stage2(_):
+            self._enqueue("network", release_all, left, self._background_error)
+        if document is not None:
+            self._enqueue("file", lambda: self.service.remember(task, document),
+                          stage2, self._background_error)
+        else:
+            stage2(None)
 
-        self.run_job(release, finished, "Releasing region…", block=True)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -1220,6 +1389,30 @@ class SVGTaskScreen(QWidget):
             self.dispatching_click = False
 
     def eventFilter(self, watched, event):
+        # Handle the main-window close even when this screen is hidden. Qt can
+        # otherwise destroy an idle QThread belonging to a hidden screen.
+        if watched is self.close_target and isinstance(event, QCloseEvent) and event.type() == QEvent.Type.Close:
+            if self.worker or self._background_callbacks:
+                self.show_status("Please wait for current background requests/saves before closing.")
+                event.ignore()
+                return True
+            if self.service.export_pending is not None:
+                self.show_status("Retry Save to finish the pending export before closing.")
+                event.ignore()
+                return True
+            if self.current_task is not None and self.dirty:
+                self.canvas.finish_drawing()
+                try:
+                    self.service.remember(self.current_task, self.snapshot())
+                except (OSError, ValueError) as exc:
+                    self.show_status(f"Cannot preserve your unsaved strokes: {exc}")
+                    event.ignore()
+                    return True
+            self.dirty = False
+            self.sync_timer.stop()
+            self._finish_background_lanes()
+            self.service.close()
+            return False
         if self.dispatching_click or not self.isVisible():
             return False
         if event.type() == QEvent.Type.ApplicationDeactivate:
@@ -1264,16 +1457,107 @@ class SVGTaskScreen(QWidget):
                     self.pointer_click(True, event.modifiers())
                 event.accept()
                 return True
-        if watched is self.close_target and isinstance(event, QCloseEvent) and event.type() == QEvent.Type.Close:
-            if self.worker:
-                self.status_label.setText("Please wait for the current save or server request, then close again.")
-                event.ignore()
-                return True
-            if self.service.export_pending is not None:
-                self.status_label.setText("Retry Save to finish the pending export before closing.")
-                event.ignore()
-                return True
-            self.dirty = False
-            self.sync_timer.stop()
-            self.service.close()
         return super().eventFilter(watched, event)
+
+
+    def _enqueue(self, lane, function, on_success, on_error=None, priority=5):
+        """UI callbacks always run in main Qt thread, never in a QThread."""
+        self._next_job_id += 1
+        job_id = self._next_job_id
+        self._background_callbacks[job_id] = (on_success, on_error)
+        (self.network_lane if lane == "network" else self.file_lane).submit(job_id, function, priority)
+        return job_id
+
+
+    @pyqtSlot(int, object, object)
+    def _background_completed(self, job_id, result, error):
+        callbacks = self._background_callbacks.pop(job_id, None)
+        if callbacks is None:
+            return
+        done, failed = callbacks
+        try:
+            if error is None:
+                done(result)
+            elif failed is not None:
+                failed(error)
+            else:
+                self.show_status(str(error))
+        except Exception as exc:
+            self.show_status(str(exc))
+
+
+    def _label_for(self, task):
+        tid = task["task_id"]
+        if tid in self._saving_tasks:
+            return f"[saving…] {task['label']}"
+        if tid in self._claiming_ids:
+            return f"[claiming…] {task['label']}"
+        st = self.service.statuses.get(tid, {})
+        status = st.get("status", "available")
+        if status == "done":
+            return f"[pending] {task['label']}" if st.get("pending_sync") else task["label"]
+        if status == "expired":
+            return f"[expired — claim] {task['label']}"
+        if status == "processing":
+            return ("[claimed by you] " if st.get("locked_by") == self.service.user_id
+                    else "[claimed by another annotator] ") + task["label"]
+        return f"[{status}] {task['label']}"
+
+
+    def _update_task_row(self, tid, update_progress=True):
+        """Update just the clicked row; rebuild lists only when Done changes tabs."""
+        item = self._task_items.get(tid)
+        if item is None:
+            return
+        task = item.data(Qt.ItemDataRole.UserRole)
+        item.setText(self._label_for(task))
+        st = self.service.statuses.get(tid, {})
+        is_done = st.get("status") == "done" and tid not in self._saving_tasks
+        owner = self.history_list if is_done else self.region_list
+        other = self.region_list if is_done else self.history_list
+        row = other.row(item)
+        if row >= 0:
+            other.takeItem(row)
+            if is_done:
+                item.setSizeHint(QSize(0, 52))
+                if tid in self.history_icons:
+                    item.setIcon(self.history_icons[tid])
+            else:
+                item.setIcon(QIcon())
+            owner.addItem(item)
+        if update_progress:
+            self.progress_label.setText(
+                f"Done: {self.history_list.count()} / {len(self.service.tasks)}"
+            + (f" ({len(self.service.pending_sync)} pending sync)" if self.service.pending_sync else "")
+        )
+
+
+    def _background_error(self, error, task=None):
+        if isinstance(error, TaskConflict):
+            self.show_status("This region is already claimed by another annotator: " + str(error))
+            QMessageBox.information(self, "Task already selected",
+                                    "This region is already claimed by another annotator.\n" + str(error))
+            # One read-only refresh will obtain the authoritative owner/status.
+            self._enqueue("network", lambda: self.service.refresh(scan=False),
+                          lambda _: self.update_regions(), lambda exc: self.show_status(str(exc)))
+            return
+        self.show_status(str(error))
+        if task is not None:
+            QMessageBox.warning(self, "Background save failed", str(error))
+
+
+    def _save_failed_finished(self, tid, error):
+        self._saving_tasks.pop(tid, None)
+        self._update_task_row(tid)
+        self.show_status(f"Save failed; local snapshot preserved for retry: {error}")
+        QMessageBox.warning(self, "Save failed", f"Task {tid}: {error}\n\nLocal snapshot was preserved.")
+        self.refresh_statuses_only()  # recover authoritative lock after a failed submit
+
+
+    def _finish_background_lanes(self):
+        self.network_lane.stop_after_jobs()
+        self.file_lane.stop_after_jobs()
+        # No user-facing jobs remain; stop the dedicated queues cleanly.
+        self.network_lane.wait()
+        self.file_lane.wait()
+

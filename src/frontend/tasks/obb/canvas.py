@@ -1,7 +1,7 @@
 from typing import List, Dict
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsEllipseItem, QGraphicsTextItem
 from PyQt6.QtCore import Qt, QPoint, QPointF, pyqtSignal
-from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter, QKeySequence
+from PyQt6.QtGui import QImage, QPen, QBrush, QColor, QPixmap, QFont, QPainter, QKeySequence
 
 class DraggablePoint(QGraphicsEllipseItem):
     def __init__(self, x, y, canvas, is_first=False):
@@ -147,7 +147,7 @@ class ImageCanvas(QGraphicsView):
         self.is_editable = True
         self.resetTransform()
         
-        pixmap = QPixmap(image_path)
+        pixmap = QPixmap.fromImage(image_path) if isinstance(image_path, QImage) else QPixmap(image_path)
         self.image_item = self.scene.addPixmap(pixmap)
         
         margin = max(pixmap.width(), pixmap.height())
