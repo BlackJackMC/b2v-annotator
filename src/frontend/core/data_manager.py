@@ -374,12 +374,12 @@ class DataManager:
             updated["existing_result"] = server_result
             return updated
 
-    def get_free_task(self, task_type: str):
+    def get_free_task(self, task_type: str, refresh: bool = True):
         tasks = self.cached_tasks.get(task_type, [])
         if not tasks:
             return None
 
-        statuses = self.refresh_statuses(task_type)
+        statuses = self.refresh_statuses(task_type, refresh=refresh)
         my_user = self.api.user_id
         unavailable_ids = set()
         existing_results = {}
@@ -420,7 +420,7 @@ class DataManager:
         pending = self.pending_sync.get(task_type, {}).get(tid)
 
         try:
-            if reopen:
+            if reopen and self.status_cache.get(task_type, {}).get(tid, {}).get("status") == "done":
                 res = self.api.reclaim_task(tid, task_type, raise_on_error=True)
             else:
                 res = self.api.claim_task(tid, task_type, raise_on_error=True)
@@ -501,7 +501,7 @@ class TaskSyncWorker(QThread):
             self.conflicts = self.manager.sync_task_state(self.task_type, self.task)
             self.manager.refresh_statuses(self.task_type)
             if self.task is None:
-                self.next_task = self.manager.get_free_task(self.task_type)
+                self.next_task = self.manager.get_free_task(self.task_type, refresh=False)
         except Exception as error:
             self.error = str(error)
 
