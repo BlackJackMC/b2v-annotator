@@ -16,6 +16,8 @@ class OBBTaskScreen(QWidget):
         self.current_task = None
         self.task_type = "obb"
         self.sync_worker = None
+        self.sync_queued = False
+        self.sync_scan_queued = False
         self.prompting_conflict = False
 
         self.sync_timer = QTimer(self)
@@ -91,6 +93,8 @@ class OBBTaskScreen(QWidget):
 
     def start_sync(self, scan=False):
         if self.sync_worker is not None or self.prompting_conflict:
+            self.sync_queued = True
+            self.sync_scan_queued = self.sync_scan_queued or scan
             return
         worker = TaskSyncWorker(self.data_manager, self.task_type, self.current_task, scan, self)
         self.sync_worker = worker
@@ -104,13 +108,18 @@ class OBBTaskScreen(QWidget):
                 self.status_label.setText(worker.error)
             else:
                 try:
-                    if worker.task is None:
+                    if worker.task is None and self.current_task is None:
                         self.set_current_task(worker.next_task)
                     self.sync_data()
-                    self.handle_conflicts(worker.conflicts)
+                    self.handle_conflicts(worker.conflicts, worker.next_task)
                 except (OSError, ValueError) as error:
                     self.status_label.setText(str(error))
             worker.deleteLater()
+            if self.sync_queued:
+                next_scan = self.sync_scan_queued
+                self.sync_queued = False
+                self.sync_scan_queued = False
+                self.start_sync(scan=next_scan)
 
         worker.finished.connect(finished)
         worker.start()
@@ -134,7 +143,7 @@ class OBBTaskScreen(QWidget):
 
         self.update_sync_status()
 
-    def handle_conflicts(self, conflicts: List[Dict]):
+    def handle_conflicts(self, conflicts: List[Dict], fallback_task=None):
         if not conflicts or self.prompting_conflict:
             return
         self.prompting_conflict = True
@@ -144,6 +153,10 @@ class OBBTaskScreen(QWidget):
                 tid = conflict.get("task_id")
                 if ctype in ("locked", "locked_active"):
                     owner = conflict.get("locked_by") or "another user"
+                    if ctype == "locked_active" and self.current_task and self.current_task["task_id"] == tid:
+                        existing_pts = (self.current_task.get("existing_result") or {}).get("points", [])
+                        if self.canvas.get_coordinates() == existing_pts and fallback_task is not None:
+                            self.set_current_task(fallback_task)
                     self.update_sync_status(f"Task {tid} is currently locked by {owner}.")
                     continue
                 if ctype in ("done", "done_active"):
@@ -185,9 +198,6 @@ class OBBTaskScreen(QWidget):
                 self.save_and_submit(coords)
 
     def save_and_submit(self, coords):
-        if self.sync_worker is not None:
-            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
-            return
         if not self.current_task:
             return
 
@@ -195,25 +205,22 @@ class OBBTaskScreen(QWidget):
 
         if not os.path.exists(image_path):
             QMessageBox.warning(self, "Error", "Local image file is missing! Action aborted.")
-            self.manual_refresh()
             self.load_next_task()
+            self.manual_refresh()
             return
 
         try:
-            conflicts = self.data_manager.save_task_local_first(self.task_type, self.current_task, coords)
+            self.data_manager.save_task_local_first(self.task_type, self.current_task, coords)
         except OSError as error:
             self.status_label.setText(str(error))
             QMessageBox.warning(self, "Save failed", str(error))
             return
-        self.handle_conflicts(conflicts)
-        self.sync_data()
         self.load_next_task()
+        self.sync_data()
+        self.start_sync()
 
     def load_next_task(self):
-        if self.sync_worker is not None:
-            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
-            return
-        task = self.data_manager.get_free_task(task_type=self.task_type)
+        task = self.data_manager.get_free_task(task_type=self.task_type, refresh=False, claim_remote=False)
         self.set_current_task(task)
         self.update_sync_status()
 

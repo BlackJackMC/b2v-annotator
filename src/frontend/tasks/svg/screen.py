@@ -30,6 +30,8 @@ class SVGTaskScreen(QWidget):
         self.busy = False
         self.job_blocking = False
         self.save_requested = False
+        self.sync_requested = False
+        self.pending_open_region = None
         self.acknowledged_conflicts = set()
         self.last_interaction_at = time.monotonic()
         self.saving = False
@@ -816,6 +818,13 @@ class SVGTaskScreen(QWidget):
             if self.save_requested:
                 self.save_requested = False
                 QTimer.singleShot(0, self.save_and_submit)
+            elif self.pending_open_region is not None:
+                target_task, target_use_local = self.pending_open_region
+                self.pending_open_region = None
+                QTimer.singleShot(0, lambda: self.open_region(target_task, target_use_local))
+            elif self.sync_requested:
+                self.sync_requested = False
+                QTimer.singleShot(0, self.start_background_sync)
 
         worker.finished.connect(finish)
         worker.start()
@@ -826,11 +835,13 @@ class SVGTaskScreen(QWidget):
         self.job_blocking = block if busy else False
         pending = self.service.export_pending is not None
         blocked = (busy and block) or pending
-        for widget in (self.back_button, self.refresh_button, self.next_button, self.region_list, self.history_list):
+        for widget in (self.back_button, self.refresh_button):
             widget.setEnabled(not busy and not pending)
-        self.save_button.setEnabled(not busy and self.current_task is not None)
-        self.copy_trace_button.setEnabled(not busy and self.saved_preview is not None and bool(self.saved_preview["document"]["strokes"]))
-        self.paste_trace_button.setEnabled(not busy and not pending and self.current_task is not None and self.copied_tracing is not None)
+        for widget in (self.next_button, self.region_list, self.history_list):
+            widget.setEnabled(not blocked)
+        self.save_button.setEnabled(not blocked and self.current_task is not None)
+        self.copy_trace_button.setEnabled(not blocked and self.saved_preview is not None and bool(self.saved_preview["document"]["strokes"]))
+        self.paste_trace_button.setEnabled(not blocked and self.current_task is not None and self.copied_tracing is not None)
         self.save_button.setText("Saving…" if self.saving else "Retry Save" if pending else "Save && Next")
         for widget in (self.canvas, self.tool_combo, self.undo_button, self.redo_button, self.pan_button,
                        self.delete_button, self.simplify_button, self.stroke_list, self.tabs, self.width_input, self.focus_button):
@@ -1085,10 +1096,24 @@ class SVGTaskScreen(QWidget):
         self.show_status(f"Pasted {len(strokes)} strokes at their original image position. Ctrl+Z undoes this paste.")
 
     def resolve_local_conflict(self, task):
-        self.show_status("Task was taken or the lock expired. Your previous edits cannot be submitted.")
+        box = QMessageBox(self)
+        box.setWindowTitle("Saved result changed")
+        box.setText("This region has a newer server result. Choose which drawing to open. Keeping local edits will replace the server result only when you save.")
+        local = box.addButton("Keep local edits", QMessageBox.ButtonRole.AcceptRole)
+        server = box.addButton("Use server result", QMessageBox.ButtonRole.DestructiveRole)
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        box.exec()
+        if box.clickedButton() in (local, server):
+            use_local = box.clickedButton() is local
+            QTimer.singleShot(0, lambda: self.open_region(task, use_local))
 
     def open_region(self, task, use_local=None):
-        if self.worker or self.service.export_pending is not None:
+        if self.service.export_pending is not None:
+            return
+        if self.worker:
+            if not self.job_blocking:
+                self.pending_open_region = (task, use_local)
             return
         if (self.current_task and self.current_task["task_id"] == task["task_id"] and use_local is None
                 and self.service.statuses.get(task["task_id"], {}).get("status") == "processing"
@@ -1108,13 +1133,37 @@ class SVGTaskScreen(QWidget):
 
         self.run_job(switch, self.set_current_task, "Claiming region on server…", block=True)
 
+    def start_background_sync(self):
+        if self.worker:
+            self.sync_requested = True
+            return
+        self.sync_requested = False
+        target_task = self.current_task
+
+        def synced(result):
+            self.update_regions()
+            if isinstance(result, dict) and result.get("active_locked"):
+                if self.current_task and target_task and self.current_task["task_id"] == target_task["task_id"] and not self.dirty:
+                    next_res = self.service.next_region_local()
+                    self.set_current_task(next_res)
+                    if next_res:
+                        self.start_background_sync()
+                self.show_status(result["active_locked"])
+
+        self.run_job(
+            lambda: self.service.sync_lock(target_task),
+            synced,
+            "Syncing with server…",
+            block=False,
+            quiet=True,
+        )
+
     def save_and_submit(self):
         if not self.current_task:
             return
-        if self.worker:
-            if not self.job_blocking:
-                self.save_requested = True
-                self.status_label.setText("Save queued until the current server request finishes.")
+        if self.worker and self.job_blocking:
+            self.save_requested = True
+            self.status_label.setText("Save queued until the current server request finishes.")
             return
         self.canvas.finish_drawing()
         document = self.snapshot()
@@ -1122,41 +1171,34 @@ class SVGTaskScreen(QWidget):
             QMessageBox.warning(self, "Tracing", "No crop image is loaded.")
             return
         task = self.current_task
-        def saved(result):
-            if not result["saved"]:
-                # Save did not complete: retain current task, drawing and local draft.
-                self.show_status(result.get("error", "Save not completed. Local drawing preserved."))
-                return
-            self.history_icons.pop(task["task_id"], None)
-            self.dirty = False
-            self.set_current_task(result["next"])
-            if result["error"]:
-                self.status_label.setText("Saved locally. Could not open the next region: " + result["error"])
+        try:
+            saved_doc = self.service.save_local_first(task, document)
+        except Exception as error:
+            self.show_status(f"Save not completed: {error}")
+            QMessageBox.warning(self, "Tracing", str(error))
+            return
 
-        def submit():
-            try:
-                self.service.submit(task, document)
-            except LocalEditsConflict as error:
-                return {"saved": False, "next": None, "error": str(error), "conflict": error.task}
-            # Other exceptions are handled by run_job and leave the screen intact.
-            try:
-                return {"saved": True, "next": None, "error": "", "conflict": None}
-            except Exception as error:
-                return {"saved": True, "next": None, "error": str(error), "conflict": None}
+        self.history_icons.pop(task["task_id"], None)
+        self.set_history_thumbnail(task, saved_doc)
+        self.dirty = False
 
-        self.saving = True
-        self.run_job(submit, saved, "Saving JSON and SVG…", block=True)
+        try:
+            next_result = self.service.next_region_local()
+            self.set_current_task(next_result)
+        except Exception as error:
+            self.set_current_task(None)
+            self.status_label.setText("Saved locally. Could not open the next region: " + str(error))
+
+        self.start_background_sync()
 
     def renew_lock(self):
         if self.worker or self.service.export_pending is not None:
             return
-        # Keep all clicked tasks leased while this screen is running.
-        # Do not silently drop previously claimed tasks after 5 minutes.
-        if not self.service.claimed_task_ids:
+        # Keep all clicked tasks leased and flush any pending saves while this screen is running.
+        if not self.service.claimed_task_ids and not self.service.pending_sync:
             self.run_job(self.service.refresh, self.update_regions, "Checking connection…", quiet=True)
             return
-        self.run_job(self.service.sync_lock, lambda result: self.update_regions(),
-                     "Renewing claimed task locks…", quiet=True)
+        self.start_background_sync()
 
     def stop_and_back(self):
         if self.worker or self.service.export_pending is not None:

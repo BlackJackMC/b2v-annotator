@@ -22,7 +22,12 @@ class ClassifyTaskScreen(QWidget):
         self.initial_label = None
         self.export_pending = None
         self.sync_worker = None
+        self.sync_queued = False
+        self.sync_scan_queued = False
         self.prompting_conflict = False
+        self.source_key = None
+        self.source_image = None
+        self.source_preview = None
         self.history = []
         self.shortcuts = []
         self.close_target = None
@@ -173,6 +178,8 @@ class ClassifyTaskScreen(QWidget):
 
     def start_sync(self, scan=False):
         if self.sync_worker is not None or self.prompting_conflict:
+            self.sync_queued = True
+            self.sync_scan_queued = self.sync_scan_queued or scan
             return
         worker = TaskSyncWorker(self.data_manager, self.task_type, self.current_task, scan, self)
         self.sync_worker = worker
@@ -186,14 +193,19 @@ class ClassifyTaskScreen(QWidget):
                 self.status_label.setText(worker.error)
             else:
                 try:
-                    if worker.task is None:
+                    if worker.task is None and self.current_task is None:
                         self.set_current_task(worker.next_task)
                     self.sync_data()
                     self.errors_button.setVisible(bool(self.data_manager.strategies[self.task_type].errors))
-                    self.handle_conflicts(worker.conflicts)
+                    self.handle_conflicts(worker.conflicts, worker.next_task)
                 except (OSError, ValueError) as error:
                     self.status_label.setText(str(error))
             worker.deleteLater()
+            if self.sync_queued:
+                next_scan = self.sync_scan_queued
+                self.sync_queued = False
+                self.sync_scan_queued = False
+                self.start_sync(scan=next_scan)
 
         worker.finished.connect(finished)
         worker.start()
@@ -210,8 +222,12 @@ class ClassifyTaskScreen(QWidget):
                 item = QListWidgetItem(label)
                 item.setData(Qt.ItemDataRole.UserRole, task)
                 widget.addItem(item)
+        if self.current_task:
+            self.status_label.setText(f"Choose the content type of this region.{self.sync_suffix()}")
+        else:
+            self.status_label.setText(f"Refresh inputs or select a saved task to edit.{self.sync_suffix()}")
 
-    def handle_conflicts(self, conflicts: List[Dict]):
+    def handle_conflicts(self, conflicts: List[Dict], fallback_task=None):
         if not conflicts or self.prompting_conflict:
             return
         self.prompting_conflict = True
@@ -221,6 +237,9 @@ class ClassifyTaskScreen(QWidget):
                 tid = conflict.get("task_id")
                 if ctype in ("locked", "locked_active"):
                     owner = conflict.get("locked_by") or "another user"
+                    if ctype == "locked_active" and self.current_task and self.current_task["task_id"] == tid:
+                        if self.selected_label == self.initial_label and fallback_task is not None:
+                            self.set_current_task(fallback_task)
                     self.status_label.setText(f"Region {tid} is currently locked by {owner}.{self.sync_suffix()}")
                     continue
                 if ctype in ("done", "done_active"):
@@ -265,11 +284,8 @@ class ClassifyTaskScreen(QWidget):
             raise ValueError("The AABB changed. Refresh inputs before classifying it.")
 
     def load_next_task(self):
-        if self.sync_worker is not None:
-            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
-            return
         try:
-            task = self.data_manager.get_free_task(self.task_type)
+            task = self.data_manager.get_free_task(self.task_type, refresh=False, claim_remote=False)
             self.set_current_task(task)
         except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError) as error:
             self.status_label.setText(f"Could not open the next region: {error}")
@@ -277,7 +293,13 @@ class ClassifyTaskScreen(QWidget):
     def set_current_task(self, task):
         if task:
             self.verify_source(task)
-            original = QImage(task["image_path"])
+            stat = Path(task["image_path"]).stat()
+            key = (task["image_path"], stat.st_size, stat.st_mtime_ns)
+            if key != self.source_key or self.source_image is None:
+                self.source_image = QImage(task["image_path"])
+                self.source_key = key
+                self.source_preview = self.source_image.scaledToWidth(240) if not self.source_image.isNull() else None
+            original = self.source_image
             if original.isNull():
                 raise ValueError("Cannot decode the source image.")
             crop = original.copy(*task["crop"])
@@ -293,7 +315,7 @@ class ClassifyTaskScreen(QWidget):
             if label not in (None, "handwriting", "sketch"):
                 raise ValueError("Unknown saved classification label.")
             self.canvas.load_image(crop)
-            preview = original.scaledToWidth(240)
+            preview = self.source_preview.copy()
             painter = QPainter(preview)
             painter.setPen(QPen(QColor("#ff28b5"), 2))
             scale = preview.width() / original.width()
@@ -316,9 +338,6 @@ class ClassifyTaskScreen(QWidget):
         self.update_choice()
 
     def save_and_submit(self):
-        if self.sync_worker is not None:
-            self.status_label.setText("Synchronization is running. Please retry this action when it finishes.")
-            return
         if not self.current_task or self.selected_label not in ("handwriting", "sketch"):
             return
         task = self.current_task
@@ -330,18 +349,18 @@ class ClassifyTaskScreen(QWidget):
                     raise ValueError("This output file belongs to another task. Choose a separate classification output folder.")
             self.verify_source(task)
             points = [{"label": self.selected_label, "image_sha256": task["image_sha256"], "crop": task["crop"]}]
-            conflicts = self.data_manager.save_task_local_first(self.task_type, task, points)
+            self.data_manager.save_task_local_first(self.task_type, task, points)
         except (requests.RequestException, OSError, ValueError, KeyError, IndexError, TypeError) as error:
             self.status_label.setText(str(error))
             QMessageBox.warning(self, "Save failed", f"{error}\nYour choice is still open. Retry Ctrl+S after resolving the problem.")
             return
         self.set_current_task(None)
-        self.handle_conflicts(conflicts)
         try:
-            self.sync_data()
             self.load_next_task()
+            self.sync_data()
         except (requests.RequestException, OSError, ValueError) as error:
             self.status_label.setText(f"Saved locally. Could not refresh tasks: {error}")
+        self.start_sync()
 
     def confirm_switch(self):
         if self.export_pending is not None:
