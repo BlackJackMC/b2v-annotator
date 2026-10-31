@@ -20,6 +20,8 @@ from tasks.svg.document import atomic_write
 class AsyncTaskWorkflow:
     def initialize_async_workflow(self):
         self._network_lane = BackgroundLane(self)
+        # Claims run independently of the Save/Submit network queue.
+        self._claim_lane = BackgroundLane(self)
         self._file_lane = BackgroundLane(self)
         self._callbacks = {}
         self._job_number = 0
@@ -32,8 +34,10 @@ class AsyncTaskWorkflow:
         self._last_list_signature = None
         self._shutting_down = False
         self._network_lane.completed.connect(self._task_job_completed)
+        self._claim_lane.completed.connect(self._task_job_completed)
         self._file_lane.completed.connect(self._task_job_completed)
         self._network_lane.start()
+        self._claim_lane.start()
         self._file_lane.start()
         self._renew_timer = QTimer(self)
         self._renew_timer.timeout.connect(self._renew_leases)
@@ -57,7 +61,8 @@ class AsyncTaskWorkflow:
         self._job_number += 1
         job_id = self._job_number
         self._callbacks[job_id] = (done, failed)
-        worker = self._network_lane if lane == "network" else self._file_lane
+        worker = (self._claim_lane if lane == "claim" else
+                  self._network_lane if lane == "network" else self._file_lane)
         worker.submit(job_id, function, priority=priority)
 
     @pyqtSlot(int, object, object)
@@ -149,6 +154,8 @@ class AsyncTaskWorkflow:
                     label = "[claimed by another annotator] "
                 elif status == "expired":
                     label = "[expired] "
+                elif status is None or status == "unknown":
+                    label = "[unknown / offline] "
                 else:
                     label = "[available] "
                 text = label + task.get("label", tid)
@@ -233,7 +240,7 @@ class AsyncTaskWorkflow:
             return choice == QMessageBox.StandardButton.Discard
         return True
 
-    def async_open(self, task, reopen=False):
+    def async_open(self, task, reopen=False, auto_next=False, skipped=None):
         if not task or self._shutting_down:
             return
         tid = task["task_id"]
@@ -247,10 +254,31 @@ class AsyncTaskWorkflow:
         self._select_number += 1
         request_number = self._select_number
         self._claiming.add(tid)
+        with self.data_manager._lock:
+            self.data_manager.claiming_tasks.add(tid)
         self.sync_data()
         self.status_label.setText("Claiming task on server…")
         def claimed(opened):
+            # Auto Next is read-only verified before claim, then checked again
+            # using the atomic claim response. The legacy backend permits
+            # claiming Done, so pre-check alone is not enough.
+            if auto_next and opened.get("_auto_skip"):
+                self._claiming.discard(tid)
+                with self.data_manager._lock:
+                    self.data_manager.claiming_tasks.discard(tid)
+                status = opened.get("_auto_status")
+                if status == "done":
+                    self._server_state(tid, "done", result=opened.get("_auto_result"))
+                else:
+                    self.sync_data()
+                if request_number == self._select_number:
+                    self.async_next(after_task_id=tid, skipped=(skipped or set()) | {tid})
+                return
             self._claiming.discard(tid)
+            with self.data_manager._lock:
+                self.data_manager.claiming_tasks.discard(tid)
+                self.data_manager.held_tasks.add(tid)
+                self.data_manager.local_locks[self.task_type] = tid
             self._claimed_tasks[tid] = dict(task)
             self._server_state(tid, "processing", self.api.user_id, opened.get("existing_result"))
             if request_number != self._select_number:
@@ -286,11 +314,37 @@ class AsyncTaskWorkflow:
             self._enqueue("file", lambda: self._load_image_file(opened), decoded, image_error)
         def claim_failed(exc):
             self._claiming.discard(tid)
+            with self.data_manager._lock:
+                self.data_manager.claiming_tasks.discard(tid)
             self.sync_data()
             QMessageBox.information(self, "Task already selected",
                                     "Cannot claim this task. It may already belong to another annotator.\n" + str(exc))
             self.async_refresh()
-        self._enqueue("network", lambda: self.data_manager.open_task(self.task_type, task, reopen=reopen),
+        def verified_claim():
+            if auto_next:
+                # A successful response with no row means never claimed.
+                rows = self.api.check_status([tid], raise_on_error=True, include_results=True)
+                state = next((row for row in rows if row.get("task_id") == tid), None)
+                if state and state.get("status") == "done":
+                    return {"_auto_skip": True, "_auto_status": "done",
+                            "_auto_result": state.get("result")}
+                if state and state.get("result") is not None:
+                    return {"_auto_skip": True, "_auto_status": state.get("status")}
+                if state and state.get("status") == "processing" and state.get("locked_by") != self.api.user_id:
+                    return {"_auto_skip": True, "_auto_status": "processing"}
+            opened = self.data_manager.open_task(self.task_type, task, reopen=reopen)
+            if auto_next and opened is not None and opened.get("existing_result") is not None:
+                # Done may have been committed between GET status and claim.
+                # Unclaim preserves the saved result and returns the task to Done.
+                self.api.unclaim_task(tid, raise_on_error=True)
+                with self.data_manager._lock:
+                    self.data_manager.held_tasks.discard(tid)
+                    if self.data_manager.local_locks.get(self.task_type) == tid:
+                        self.data_manager.local_locks[self.task_type] = None
+                return {"_auto_skip": True, "_auto_status": "done",
+                        "_auto_result": opened["existing_result"]}
+            return opened
+        self._enqueue("claim", verified_claim,
                       lambda opened: claimed(opened) if opened is not None else claim_failed("Claim was refused"),
                       claim_failed, priority=0)
 
@@ -302,6 +356,25 @@ class AsyncTaskWorkflow:
         return (output.parent / (".board2vec_state_" + self.task_type + "_" + output.name)
                 / (digest + ".json"))
 
+    def _submit_with_verification(self, tid, result):
+        """Resolve ambiguous HTTP outcomes. Never resend an uncertain POST.
+
+        A completed POST may lose its HTTP response. Only matching server
+        Done + identical result counts as committed; otherwise keep recovery.
+        """
+        try:
+            return self.api.submit_task(tid, result, raise_on_error=True)
+        except (OfflineError, TaskConflictError) as original:
+            try:
+                rows = self.api.check_status([tid], raise_on_error=True,
+                                             include_results=True)
+            except (OfflineError, TaskConflictError):
+                raise original
+            match = next((row for row in rows if row.get("task_id") == tid), None)
+            if match and match.get("status") == "done" and match.get("result") == result:
+                return True
+            raise original
+
     def async_save(self, points):
         if not self.current_task:
             return
@@ -311,6 +384,8 @@ class AsyncTaskWorkflow:
             return
         result = {"points": copy.deepcopy(points)}
         self._saving.add(tid)
+        with self.data_manager._lock:
+            self.data_manager.active_saves.add(tid)
         self._last_activity = time.monotonic()
         # Freeze UI's current task, but another task may be opened immediately.
         self.set_current_task(None)
@@ -326,10 +401,16 @@ class AsyncTaskWorkflow:
             return True
         def file_ready(_):
             # Do not auto-claim/reclaim during Save: ownership was acquired on click.
-            self._enqueue("network", lambda: self.api.submit_task(tid, result, raise_on_error=True),
+            self._enqueue("network", lambda: self._submit_with_verification(tid, result),
                           remote_done, save_error, priority=1)
         def remote_done(_):
+            with self.data_manager._lock:
+                self.data_manager.committed_saves.add(tid)
+                self.data_manager.held_tasks.discard(tid)
             self._claimed_tasks.pop(tid, None)
+            with self.data_manager._lock:
+                if self.data_manager.local_locks.get(self.task_type) == tid:
+                    self.data_manager.local_locks.pop(self.task_type, None)
             self._failed_saves.pop(tid, None)
             self._server_state(tid, "done", None)
             self.status_label.setText("Saved to MongoDB: " + tid)
@@ -347,14 +428,20 @@ class AsyncTaskWorkflow:
                 pending_path.unlink(missing_ok=True)
                 return True
             def exported(_):
+                with self.data_manager._lock:
+                    self.data_manager.active_saves.discard(tid)
                 self.status_label.setText("Saved to server and exported: " + tid)
             def export_failed(exc):
+                with self.data_manager._lock:
+                    self.data_manager.active_saves.discard(tid)
                 self.status_label.setText(
                     "Saved to MongoDB but local export failed. Recovery retained: " + str(exc))
             self._enqueue("file", export_local, exported, export_failed, priority=1)
             self._saving.discard(tid)
             self.sync_data()
         def save_error(exc):
+            with self.data_manager._lock:
+                self.data_manager.active_saves.discard(tid)
             self._saving.discard(tid)
             self._failed_saves[tid] = result
             self.sync_data()
@@ -367,9 +454,10 @@ class AsyncTaskWorkflow:
                 "\nReopen the task and retry Save after resolving the issue.")
         self._enqueue("file", prepare, file_ready, save_error, priority=1)
 
-    def async_next(self, after_task_id=None):
+    def async_next(self, after_task_id=None, skipped=None):
         if self.current_task is not None or self._claiming:
             return
+        skipped = skipped or set()
         tasks = list(self.data_manager.cached_tasks.get(self.task_type, []))
         states = self.data_manager.status_cache.get(self.task_type, {})
         start = next((i for i, t in enumerate(tasks)
@@ -379,13 +467,13 @@ class AsyncTaskWorkflow:
         for task in candidates:
             tid = task["task_id"]
             st = states.get(tid, {})
-            if tid in self._saving or tid in self._claiming or st.get("status") == "done":
+            if tid in skipped or tid in self._saving or tid in self._claiming or st.get("status") not in ("available", "expired", "processing"):
                 continue
             if st.get("status") == "processing" and st.get("locked_by") != self.api.user_id:
                 continue
-            self.async_open(task)
+            self.async_open(task, auto_next=True, skipped=skipped)
             return
-        self.status_label.setText("No available task; Refresh to check new tasks.")
+        self.status_label.setText("No verified available task; Refresh to check new tasks.")
 
     def _renew_leases(self):
         if (not self.isVisible() or self._shutting_down or
@@ -432,5 +520,5 @@ class AsyncTaskWorkflow:
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        for lane in (self._network_lane, self._file_lane):
+        for lane in (self._network_lane, self._claim_lane, self._file_lane):
             lane.stop_after_jobs()

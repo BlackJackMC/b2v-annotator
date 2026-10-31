@@ -1,4 +1,5 @@
 import json
+import hashlib
 import os
 import threading
 from pathlib import Path
@@ -21,6 +22,10 @@ class DataManager:
         self.status_cache: Dict[str, Dict[str, Dict]] = {}
         self.pending_sync: Dict[str, Dict[str, Dict]] = {}
         self.local_locks: Dict[str, Optional[str]] = {}
+        self.active_saves: set[str] = set()
+        self.claiming_tasks: set[str] = set()
+        self.held_tasks: set[str] = set()
+        self.committed_saves: set[str] = set()  # protect this session's acknowledged exports
 
         self.strategies = {
             "obb": OBBStrategy("obb"),
@@ -91,6 +96,19 @@ class DataManager:
             return
 
         scanned = strategy.scan_local_folder(config)
+        # A single output path must never belong to two distinct task IDs.
+        destinations = {}
+        for task in scanned:
+            output = task.get("output_path")
+            if not output:
+                continue
+            path_key = os.path.normcase(str(Path(output).resolve()))
+            previous = destinations.setdefault(path_key, task["task_id"])
+            if previous != task["task_id"]:
+                raise ValueError(
+                    f"Output JSON collision: {output} is shared by {previous} "
+                    f"and {task['task_id']}. Fix the dataset/output naming before saving."
+                )
         with self._lock:
             self.cached_tasks[task_type] = scanned
 
@@ -119,6 +137,34 @@ class DataManager:
         except (OSError, ValueError):
             return None
         return None
+
+    def cleanup_available_json(self, task_type: str, task: Dict) -> bool:
+        """Remove a valid stale export only when the server explicitly says available.
+
+        Never touch pending work, a current claim, or a save in flight.
+        This is intentionally NOT used when the network is offline/unknown.
+        """
+        tid = task["task_id"]
+        with self._lock:
+            st = self.status_cache.get(task_type, {}).get(tid, {})
+            if (st.get("status") != "available" or tid in self.active_saves
+                    or tid in self.committed_saves or tid in self.claiming_tasks
+                    or tid in self.held_tasks
+                    or tid in self.pending_sync.get(task_type, {})
+                    or self.local_locks.get(task_type) == tid):
+                return False
+            output = task.get("output_path")
+            if not output or self.local_result_for_task(task_type, task) is None:
+                return False
+            # Keep the recovery snapshot if a previous Save was not confirmed.
+            digest = hashlib.sha256(tid.encode("utf-8")).hexdigest()
+            folder = Path(self.task_configs[task_type]["output"]).resolve()
+            recovery = (folder.parent / (".board2vec_state_" + task_type + "_" + folder.name)
+                        / (digest + ".json"))
+            if recovery.exists():
+                return False
+            Path(output).unlink(missing_ok=True)
+            return True
 
     def write_local_output(self, task_type: str, task: Dict, result_payload: Dict):
         output_path = Path(task["output_path"])
@@ -158,23 +204,31 @@ class DataManager:
         if refresh:
             try:
                 remote_list = self.api.check_status(task_ids, raise_on_error=True, include_results=False)
-                new_cache = {item["task_id"]: item for item in remote_list}
+                # Legacy backend omits tasks that have never been claimed.
+                # A successful full response makes those missing IDs available.
+                new_cache = {tid: {"task_id": tid, "status": "available", "locked_by": None}
+                             for tid in task_ids}
+                new_cache.update({item["task_id"]: item for item in remote_list})
                 with self._lock:
                     cache = self.status_cache.setdefault(task_type, {})
                     cache.clear()
                     cache.update(new_cache)
+                # Only an explicit server 'available' can invalidate local exports.
+                # Do not delete on offline/unknown statuses or active/pending saves.
+                for task in tasks:
+                    if new_cache.get(task["task_id"], {}).get("status") == "available":
+                        self.cleanup_available_json(task_type, task)
             except (OfflineError, TaskConflictError):
-                for t in tasks:
-                    tid = t["task_id"]
-                    with self._lock:
-                        in_cache = tid in self.status_cache.get(task_type, {})
-                    if not in_cache:
-                        local_res = self.local_result_for_task(task_type, t)
-                        if local_res is not None:
-                            with self._lock:
-                                self.status_cache.setdefault(task_type, {})[tid] = {
-                                    "task_id": tid, "status": "done", "locked_by": None, "result": local_res
-                                }
+                # A failed/partial refresh cannot authenticate status. Never
+                # manufacture Done from a file or reuse a stale Available row.
+                # Unknown is deliberately excluded from automatic Next.
+                with self._lock:
+                    cache = self.status_cache.setdefault(task_type, {})
+                    for tid in task_ids:
+                        previous = cache.get(tid, {})
+                        cache[tid] = {"task_id": tid, "status": "unknown",
+                                      "locked_by": previous.get("locked_by"),
+                                      "status_unverified": True}
 
         with self._lock:
             cache = self.status_cache.setdefault(task_type, {})
@@ -182,9 +236,10 @@ class DataManager:
             for tid, entry in self.pending_sync.get(task_type, {}).items():
                 effective[tid] = {
                     "task_id": tid,
-                    "status": "done",
+                    "status": "unknown",
                     "locked_by": None,
                     "result": entry.get("result"),
+                    "status_unverified": True,
                     "pending_sync": True
                 }
             locked_tid = self.local_locks.get(task_type)
@@ -545,7 +600,7 @@ class DataManager:
             res = self.api.claim_task(tid, task_type, raise_on_error=True)
             if res:
                 task_copy["existing_result"] = (
-                    pending.get("result") if pending else res.get("existing_result") or self.local_result_for_task(task_type, task)
+                    pending.get("result") if pending else res.get("existing_result")
                 )
                 with self._lock:
                     self.local_locks[task_type] = tid
