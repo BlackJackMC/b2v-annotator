@@ -1,7 +1,7 @@
 from typing import List, Dict
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem
 from PyQt6.QtCore import Qt, QPoint, QPointF, pyqtSignal
-from PyQt6.QtGui import QPen, QBrush, QColor, QPixmap, QFont, QPainter, QPolygonF, QPainterPath, QKeySequence
+from PyQt6.QtGui import QImage, QPen, QBrush, QColor, QPixmap, QFont, QPainter, QPolygonF, QPainterPath, QKeySequence
 
 class BoundingBox(QGraphicsRectItem):
     def __init__(self, x, y, w, h, canvas):
@@ -307,10 +307,16 @@ class ImageCanvas(QGraphicsView):
         self.crop_offset_x = 0
         self.crop_offset_y = 0
         
-        pixmap = QPixmap(image_path)
-        self.image_size = (pixmap.width(), pixmap.height())
-        
-        if crop_coords and len(crop_coords) == 4:
+        pre_cropped = isinstance(image_path, dict) and image_path.get("pre_cropped")
+        if pre_cropped:
+            pixmap = QPixmap.fromImage(image_path["image"])
+            self.image_size = tuple(image_path["full_size"])
+            self.crop_offset_x, self.crop_offset_y = image_path["offset"]
+        else:
+            pixmap = QPixmap.fromImage(image_path) if isinstance(image_path, QImage) else QPixmap(image_path)
+            self.image_size = (pixmap.width(), pixmap.height())
+
+        if not pre_cropped and crop_coords and len(crop_coords) == 4:
             points = [QPointF(p["x"], p["y"]) for p in crop_coords]
             polygon = QPolygonF(points)
             

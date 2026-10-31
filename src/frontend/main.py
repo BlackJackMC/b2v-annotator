@@ -60,7 +60,7 @@ class MainWindow(QMainWindow):
             if task_type == "svg":
                 self.data_manager.task_configs[task_type] = config_dict
             else:
-                self.data_manager.set_task_config(task_type, config_dict)
+                self.data_manager.set_task_config(task_type, config_dict, scan=False)
 
         if task_type not in self.workspace_screens:
             if task_type == "obb":
@@ -88,6 +88,47 @@ class MainWindow(QMainWindow):
                 self.status_bar.showMessage("SVG: choose visible hints with Shortcuts below the canvas; edit bindings in Keys.")
             elif task_type == "classify":
                 self.status_bar.showMessage("[1/H] Handwriting | [2/K] Sketch | [Esc] Clear | [Ctrl+Z] Undo choice | [Ctrl+S] Save & Next | [F] Fit | [Wheel] Zoom | [Drag] Pan")
+
+    def closeEvent(self, event):
+        for screen in self.workspace_screens.values():
+            if getattr(screen, "has_active_jobs", lambda: False)():
+                self.status_bar.showMessage("Background tasks are still running; retry closing after completion.")
+                event.ignore()
+                return
+            if (getattr(screen, "_background_callbacks", None) or
+                    getattr(screen, "_saving_tasks", None) or
+                    getattr(screen, "_claiming_ids", None) or
+                    getattr(screen, "worker", None)):
+                self.status_bar.showMessage("SVG background tasks are still running; retry closing after completion.")
+                event.ignore()
+                return
+        for screen in self.workspace_screens.values():
+            if getattr(screen, "_failed_saves", {}):
+                from PyQt6.QtWidgets import QMessageBox
+                response = QMessageBox.question(
+                    self, "Unsynced annotations",
+                    "Some saves were not confirmed by the server. Closing may discard in-memory recovery snapshots. Close anyway?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No)
+                if response != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+                break
+        current = self.stacked_widget.currentWidget()
+        if hasattr(current, "confirm_unsaved_switch") and not current.confirm_unsaved_switch():
+            event.ignore()
+            return
+        for screen in self.workspace_screens.values():
+            if hasattr(screen, "shutdown_async"):
+                screen.shutdown_async()
+                for lane in (screen._network_lane, screen._file_lane):
+                    if not lane.wait(1000):
+                        self.status_bar.showMessage("Still stopping a background thread; retry closing.")
+                        event.ignore()
+                        return
+            elif hasattr(screen, "_finish_background_lanes"):
+                screen._finish_background_lanes()
+        super().closeEvent(event)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

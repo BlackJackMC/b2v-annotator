@@ -33,7 +33,7 @@ class DataManager:
         strategy = self.strategies.get(task_type)
         return strategy.get_required_folders() if strategy else {}
 
-    def set_task_config(self, task_type: str, config_dict: dict):
+    def set_task_config(self, task_type: str, config_dict: dict, scan: bool = True):
         for key, path_str in config_dict.items():
             if "output" in key.lower():
                 Path(path_str).mkdir(parents=True, exist_ok=True)
@@ -42,7 +42,8 @@ class DataManager:
             self.task_configs[task_type] = config_dict
             self.status_cache.setdefault(task_type, {})
             self.load_pending_queue(task_type)
-        self.scan_local_folder(task_type)
+        if scan:
+            self.scan_local_folder(task_type)
 
     def pending_queue_path(self, task_type: str) -> Optional[Path]:
         config = self.task_configs.get(task_type, {})
@@ -156,7 +157,7 @@ class DataManager:
         task_ids = [t["task_id"] for t in tasks]
         if refresh:
             try:
-                remote_list = self.api.check_status(task_ids, raise_on_error=True)
+                remote_list = self.api.check_status(task_ids, raise_on_error=True, include_results=False)
                 new_cache = {item["task_id"]: item for item in remote_list}
                 with self._lock:
                     cache = self.status_cache.setdefault(task_type, {})
@@ -541,24 +542,21 @@ class DataManager:
             cached_status = dict(self.status_cache.get(task_type, {}).get(tid, {}))
 
         try:
-            if reopen and cached_status.get("status") == "done":
-                res = self.api.reclaim_task(tid, task_type, raise_on_error=True)
-            else:
-                res = self.api.claim_task(tid, task_type, raise_on_error=True)
+            res = self.api.claim_task(tid, task_type, raise_on_error=True)
             if res:
                 task_copy["existing_result"] = (
                     pending.get("result") if pending else res.get("existing_result") or self.local_result_for_task(task_type, task)
                 )
                 with self._lock:
                     self.local_locks[task_type] = tid
+                    self.status_cache.setdefault(task_type, {})[tid] = {
+                        "task_id": tid, "status": "processing", "locked_by": self.api.user_id,
+                        "has_result": res.get("existing_result") is not None,
+                    }
                 return task_copy
         except OfflineError:
-            task_copy["existing_result"] = (
-                pending.get("result") if pending else cached_status.get("result") or self.local_result_for_task(task_type, task)
-            )
-            with self._lock:
-                self.local_locks[task_type] = tid
-            return task_copy
+            # Never display an editable task unless MongoDB has acknowledged its lease.
+            return None
         except TaskConflictError:
             return None
         return None
@@ -632,11 +630,8 @@ class TaskSyncWorker(QThread):
         try:
             if self.scan:
                 self.manager.scan_local_folder(self.task_type)
-            self.conflicts = self.manager.sync_task_state(self.task_type, self.task)
             self.manager.refresh_statuses(self.task_type)
-            locked_active = any(c.get("type") == "locked_active" for c in self.conflicts)
-            if self.task is None or locked_active:
-                self.next_task = self.manager.get_free_task(self.task_type, refresh=False, claim_remote=True)
+            # Read-only refresh. Only a user click or explicit Next may claim.
         except Exception as error:
             self.error = str(error)
 

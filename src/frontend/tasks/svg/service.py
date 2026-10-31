@@ -71,6 +71,7 @@ class TraceService:
         self.pending_sync = {}
         self.saved_versions = {}
         self.export_pending = None
+        self._http_local = threading.local()
         self.session = None
         self.source_image = None
         self.source_key = None
@@ -226,9 +227,10 @@ class TraceService:
     def post(self, path, payload):
         """Make one API request; preserve the backend's actual conflict reason."""
         try:
-            if self.session is None:
-                self.session = requests.Session()
-            with self.session.post(
+            # A Session must not be shared by the GUI, disk and network lanes.
+            if not hasattr(self._http_local, "session"):
+                self._http_local.session = requests.Session()
+            with self._http_local.session.post(
                 f"{self.base_url}{path}", json=payload, timeout=(3, 20)
             ) as response:
                 self.online = True
@@ -246,6 +248,8 @@ class TraceService:
         except TaskConflict:
             raise
         except requests.HTTPError as error:
+            # A server-side 500 is not an offline connection. Keep its HTTP
+            # status and URL visible so a backend traceback can be correlated.
             self.online = True
             self.api.online = True
             raise RuntimeError(f"Server error while accessing {path}: {error}") from error
@@ -255,6 +259,7 @@ class TraceService:
             raise OfflineSyncError(
                 f"Could not sync tracing with the server: {error}"
             ) from error
+
 
     def close(self):
         if self.session is not None:
@@ -286,16 +291,27 @@ class TraceService:
             return None
 
     def check_status(self, task_ids, include_results=True):
+
         result = {}
+
         if not task_ids and not self.online:
+
             self.post("/tasks", {"task_ids": []})
+
         for offset in range(0, len(task_ids), 200):
+
             data = self.post("/tasks", {"task_ids": task_ids[offset:offset + 200]})
+
             for task in data["tasks"]:
+
                 if not include_results:
+
                     task.pop("result", None)
+
                 result[task["task_id"]] = task
+
         return result
+
 
     def saved_tracing(self, task):
         document = self.local_document(task)
@@ -325,69 +341,29 @@ class TraceService:
                 }
 
     def refresh(self, scan=False):
-        """Read MongoDB ownership and flush any pending local saves."""
+        """Read-only status refresh; clicking a task is the only way to claim."""
         if scan:
-            scanned = self.strategy.scan_local_folder(self.config)
-            with self._lock:
-                self.tasks = scanned
-        try:
-            self.flush_pending_sync()
-        except (OfflineSyncError, LocalEditsConflict):
-            pass
-
+            self.refresh_local_scan()
         with self._lock:
-            tasks_snapshot = list(self.tasks)
-            previously_claimed = set(self.claimed_task_ids)
-
+            snapshot = list(self.tasks)
         try:
-            remote = self.check_status(
-                [task["task_id"] for task in tasks_snapshot], include_results=False
-            )
+            remote = self.check_status([t["task_id"] for t in snapshot], include_results=False)
             with self._lock:
                 self.statuses = remote
-                self.claimed_task_ids = {
+                self.claimed_task_ids.intersection_update({
                     tid for tid, st in remote.items()
-                    if st.get("status") == "processing"
-                    and st.get("locked_by") == self.user_id
-                }
-                pending_ids = set(self.pending_sync.keys())
-
-            by_id = {task["task_id"]: task for task in tasks_snapshot}
-            for tid in previously_claimed - self.claimed_task_ids - pending_ids:
-                task = by_id.get(tid)
-                if task is None:
-                    continue
-                state = remote.get(tid, {})
-                if state.get("status") == "done":
-                    continue
-                try:
-                    self.claim(task)
-                except TaskConflict:
-                    with self._lock:
-                        self.claimed_task_ids.discard(tid)
-                except OfflineSyncError:
-                    with self._lock:
-                        self.claimed_task_ids.add(tid)
-                        self.statuses[tid] = {
-                            "status": "processing",
-                            "locked_by": self.user_id,
-                            "unverified": True,
-                        }
-                    break
+                    if st.get("status") == "processing" and st.get("locked_by") == self.user_id
+                })
         except OfflineSyncError:
             with self._lock:
-                for task in tasks_snapshot:
+                for task in snapshot:
                     tid = task["task_id"]
                     if tid not in self.statuses and Path(task["output_path"]).is_file():
                         self.statuses[tid] = {"status": "done", "locked_by": None}
-
         self._apply_pending_overlay()
         with self._lock:
-            return {
-                "tasks": list(self.tasks),
-                "statuses": dict(self.statuses),
-                "errors": list(self.strategy.errors),
-            }
+            return {"tasks": list(self.tasks), "statuses": dict(self.statuses),
+                    "errors": list(self.strategy.errors)}
 
     def claim(self, task, reopen=False):
         """Atomically acquire any task (new, Done, expired, or already ours)."""
@@ -890,3 +866,83 @@ class TraceService:
         except OfflineSyncError:
             pass
         return result
+
+    def renew_tasks(self, task_ids):
+        """Renew existing locks using the unchanged backend's atomic /claim.
+
+        No /tasks/renew route exists on the legacy server. One claim is sent
+        for each task, so large outstanding selections remain a TTL risk.
+        """
+        renewed = []
+        for tid in dict.fromkeys(task_ids):
+            try:
+                self.post(f"/tasks/{tid}/claim", {
+                    "user_id": self.user_id, "task_type": "svg"})
+                renewed.append(tid)
+            except TaskConflict:
+                continue
+        return renewed
+
+    def refresh_local_scan(self):
+        """Disk-only scanning. Call from the file lane, never the Qt UI thread."""
+        scanned = self.strategy.scan_local_folder(self.config)
+        with self._lock:
+            self.tasks = scanned
+        return len(scanned)
+
+
+    def prepare_submission(self, task, document):
+        """CPU/disk validation only; safe in an image/file worker."""
+        self.verify_source(task)
+        result = compact_annotation(document, task, self.user_id)
+        validate_annotation(result, task)
+        return result
+
+
+    def submit_remote(self, task, result):
+        """Network lane ONLY: HTTP commit; no disk writes or draft mutations.
+
+        Callers must update GUI status after acknowledgment and schedule
+        export_submitted() on file lane; errors preserve their snapshot there.
+        """
+        tid = task["task_id"]
+        self.post(f"/tasks/{tid}", {"user_id": self.user_id, "result": result})
+        return result
+
+
+    def export_submitted(self, task, result):
+        """FILE lane ONLY, after DB acknowledgment. Never resubmit on export failure."""
+        tid = task["task_id"]
+        with self._lock:
+            self.saved_versions[tid] = self.document_version(result)
+            self.pending.pop(tid, None)
+            self.conflicted.discard(tid)
+            self.save_local_drafts()
+        contents = prepare_export(task, result)
+        write_export(task, result, contents=contents)
+        return result
+
+
+    def load_claimed_region(self, task, claim_result):
+        """File/image phase only. Caller handles releasing a failed lease via
+        the network lane; NEVER do synchronous HTTP in this file worker.
+        """
+        return self._load_claimed_region(task, claim_result)
+
+
+    def preserve_failed_save(self, task, document):
+        """Persist an immutable snapshot after failed network commit.
+
+        No server request here. The retry draft is kept separately until an
+        authorized claim checks the server result again.
+        """
+        tid = task["task_id"]
+        with self._lock:
+            self.pending[tid] = {
+                "base": self.saved_versions.get(tid),
+                "document": copy.deepcopy(document),
+                "conflict": False,
+                "save_failed": True,
+            }
+            self.save_local_drafts()
+
