@@ -1,143 +1,151 @@
 from datetime import datetime, timedelta, timezone
-from pymongo.errors import DuplicateKeyError
-from pymongo import ReturnDocument
-from fastapi import HTTPException, status
 from typing import List
-from beanie.operators import In
 
+from beanie.operators import In
+from fastapi import HTTPException, status
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
+
+from backend.app.schemas import ClaimTaskRequest, SubmitTaskRequest
 from backend.domain.models import AnnotationTask
 from backend.infra.config import settings
-from backend.app.schemas import ClaimTaskRequest, SubmitTaskRequest
+
 
 class TaskUseCase:
     @staticmethod
+    def _now():
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _threshold(now):
+        return now - timedelta(minutes=settings.LOCK_TIMEOUT_MINUTES)
+
+    @staticmethod
+    def _collection():
+        # Beanie in the user's environment exposes get_motor_collection().
+        return AnnotationTask.get_motor_collection()
+
+    @staticmethod
     async def check_status(task_ids: List[str]):
-        tasks = await AnnotationTask.find(
-            In(AnnotationTask.task_id, task_ids)
-        ).to_list()
-        
-        now = datetime.now(timezone.utc)
-        timeout_threshold = now - timedelta(minutes=settings.LOCK_TIMEOUT_MINUTES)
-        
+        if not task_ids:
+            return []
+        rows = await AnnotationTask.find(In(AnnotationTask.task_id, task_ids)).to_list()
+        threshold = TaskUseCase._threshold(TaskUseCase._now())
         result = []
-        for t in tasks:
-            task_dict = t.model_dump()
-            if t.status == "processing" and t.locked_at:
-                locked_at = t.locked_at
-                if locked_at.tzinfo is None:
-                    locked_at = locked_at.replace(tzinfo=timezone.utc)
-                if locked_at < timeout_threshold:
-                    task_dict["status"] = "expired" 
-            result.append(task_dict)
-            
+        for row in rows:
+            item = row.model_dump()
+            stamp = row.locked_at
+            if stamp is not None and stamp.tzinfo is None:
+                stamp = stamp.replace(tzinfo=timezone.utc)
+            if row.status == "processing" and (stamp is None or stamp < threshold):
+                item["status"] = "expired"
+            result.append(item)
         return result
 
     @staticmethod
-    async def claim_task(task_id: str, request: ClaimTaskRequest):
-        now = datetime.now(timezone.utc)
-        
+    async def _acquire(task_id: str, request: ClaimTaskRequest):
+        """Obtain exactly one lock. A live lock by another user never changes."""
+        now = TaskUseCase._now()
+        collection = TaskUseCase._collection()
         try:
-            new_task = AnnotationTask(
+            await AnnotationTask(
                 task_id=task_id,
                 task_type=request.task_type,
                 status="processing",
                 locked_by=request.user_id,
-                locked_at=now
-            )
-            await new_task.insert()
-            return {"message": "Task claimed successfully"}
-            
+                locked_at=now,
+            ).insert()
+            return {"message": "Task claimed", "existing_result": None}
         except DuplicateKeyError:
-            timeout_threshold = now - timedelta(minutes=settings.LOCK_TIMEOUT_MINUTES)
-            
-            collection = AnnotationTask.get_motor_collection()
-            updated_doc = await collection.find_one_and_update(
-                {
-                    "task_id": task_id,
-                    "status": "processing",
-                    "$or": [
-                        {"locked_at": {"$lt": timeout_threshold}},
-                        {"locked_by": request.user_id} 
-                    ]
-                },
-                {"$set": {"locked_by": request.user_id, "locked_at": now}},
-                return_document=ReturnDocument.AFTER
-            )
-            
-            if not updated_doc:
-                raise HTTPException(
-                    status_code=status.HTTP_409_CONFLICT,
-                    detail="Task is currently locked by someone else or already done."
-                )
-                
-            return {
-                "message": "Task claim stolen or resumed",
-                "existing_result": updated_doc.get("result") 
-            }
+            pass
 
-    @staticmethod
-    async def submit_task(task_id: str, request: SubmitTaskRequest):
-        collection = AnnotationTask.get_motor_collection()
-        updated_doc = await collection.find_one_and_update(
+        doc = await collection.find_one_and_update(
             {
                 "task_id": task_id,
-                "locked_by": request.user_id,
-                "status": "processing",
-                "locked_at": {"$gte": datetime.now(timezone.utc) - timedelta(minutes=settings.LOCK_TIMEOUT_MINUTES)}
+                "task_type": request.task_type,
+                "$or": [
+                    {"status": "done", "locked_by": None},
+                    {"status": "processing", "locked_by": request.user_id},
+                    {
+                        "status": "processing",
+                        "$or": [
+                            {"locked_at": {"$lt": TaskUseCase._threshold(now)}},
+                            {"locked_at": None},
+                        ],
+                    },
+                ],
             },
-            {"$set": {"status": "done", "result": request.result, "locked_by": None, "locked_at": None}},
-            return_document=ReturnDocument.AFTER
+            {"$set": {
+                "status": "processing",
+                "locked_by": request.user_id,
+                "locked_at": now,
+            }},
+            return_document=ReturnDocument.AFTER,
         )
-        
-        if not updated_doc:
+        if doc is None:
             raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="Task not found or lock expired."
+                status_code=status.HTTP_409_CONFLICT,
+                detail="This task is claimed by another annotator or cannot be opened. Choose another task.",
             )
-        return {"message": "Task completed successfully"}
+        return {"message": "Task claimed", "existing_result": doc.get("result")}
+
+    @staticmethod
+    async def claim_task(task_id: str, request: ClaimTaskRequest):
+        return await TaskUseCase._acquire(task_id, request)
 
     @staticmethod
     async def reclaim_task(task_id: str, request: ClaimTaskRequest):
-        now = datetime.now(timezone.utc)
-        
-        collection = AnnotationTask.get_motor_collection()
-        updated_doc = await collection.find_one_and_update(
+        return await TaskUseCase._acquire(task_id, request)
+
+    @staticmethod
+    async def submit_task(task_id: str, request: SubmitTaskRequest):
+        now = TaskUseCase._now()
+        doc = await TaskUseCase._collection().find_one_and_update(
             {
                 "task_id": task_id,
-                "status": "done"
+                "status": "processing",
+                "locked_by": request.user_id,
+                "locked_at": {"$gte": TaskUseCase._threshold(now)},
             },
-            {"$set": {"status": "processing", "locked_by": request.user_id, "locked_at": now}},
-            return_document=ReturnDocument.AFTER
+            {"$set": {
+                "status": "done",
+                "result": request.result,
+                "locked_by": None,
+                "locked_at": None,
+            }},
+            return_document=ReturnDocument.AFTER,
         )
-        
-        if not updated_doc:
+        if doc is None:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
-                detail="Task is not in 'done' state or is currently being edited by someone else."
+                detail="Cannot save: your lock expired or another annotator owns this task.",
             )
-            
-        return {
-            "message": "Task reclaimed for editing",
-            "existing_result": updated_doc.get("result") 
-        }
+        return {"message": "Task saved successfully"}
 
     @staticmethod
     async def unclaim_task(task_id: str, user_id: str):
-        task = await AnnotationTask.find_one(
-            AnnotationTask.task_id == task_id,
-            AnnotationTask.locked_by == user_id,
-            AnnotationTask.status == "processing"
+        now = TaskUseCase._now()
+        collection = TaskUseCase._collection()
+        lease = {
+            "task_id": task_id,
+            "status": "processing",
+            "locked_by": user_id,
+            "locked_at": {"$gte": TaskUseCase._threshold(now)},
+        }
+        doc = await collection.find_one_and_update(
+            {**lease, "result": {"$exists": True, "$ne": None}},
+            {"$set": {"status": "done", "locked_by": None, "locked_at": None}},
+            return_document=ReturnDocument.AFTER,
         )
-        
-        if not task:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, 
-                detail="Task not found or you don't own the lock."
-            )
-            
-        if task.result:
-            await task.update({"$set": {"status": "done", "locked_by": None, "locked_at": None}})
-            return {"message": "Edit cancelled, task reverted to done"}
-        else:
-            await task.delete()
-            return {"message": "Task unclaimed and removed from DB"}
+        if doc is not None:
+            return {"message": "Task released, saved result preserved"}
+
+        doc = await collection.find_one_and_delete(
+            {**lease, "$or": [{"result": None}, {"result": {"$exists": False}}]},
+        )
+        if doc is not None:
+            return {"message": "Unfinished task released"}
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Cannot release: your task lock expired or ownership changed.",
+        )

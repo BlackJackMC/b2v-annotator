@@ -3,13 +3,15 @@ import math
 import time
 import uuid
 from PyQt6.QtCore import Qt, QEvent, QPointF, QRectF, QTimer, QVariantAnimation, QEasingCurve, pyqtSignal
-from PyQt6.QtGui import QColor, QBrush, QCursor, QFont, QKeySequence, QMouseEvent, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QTransform, QUndoCommand, QUndoStack
+from PyQt6.QtGui import QColor, QBrush, QCursor, QFont, QKeySequence, QMouseEvent, QTabletEvent, QPainter, QPainterPath, QPainterPathStroker, QPen, QPixmap, QPolygonF, QTransform, QUndoCommand, QUndoStack
 from PyQt6.QtWidgets import QApplication, QGraphicsEllipseItem, QGraphicsPathItem, QGraphicsScene, QGraphicsTextItem, QGraphicsView
 from tasks.svg.geometry import StrokeFilter, distance_squared, segment_distance_squared, simplify_points, rounded_polyline, smooth_stroke, point_widths, set_widths, remap_widths, reshape_stroke, stroke_outline
 
 
-def painter_path(points, width=1, widths=None):
+def painter_path(points, width: float = 1.0, widths=None):
     path = QPainterPath()
+    if not points:
+        return path
     if widths is not None:
         left, right = stroke_outline(points, widths)
         if not right:
@@ -74,7 +76,9 @@ class TracePathItem(QGraphicsPathItem):
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         canvas.graphics_scene.addItem(self)
 
-    def paint(self, painter, option, widget=None):
+    def paint(self, painter: QPainter, option, widget=None):
+        if painter is None:
+            return
         painter.save()
         painter.setClipRect(self.clip_rect.translated(-self.pos()), Qt.ClipOperation.IntersectClip)
         super().paint(painter, option, widget)
@@ -91,15 +95,27 @@ class StrokeItem(TracePathItem):
         self.stroke = stroke
         self.stroke_id = stroke["id"]
         self.setPos(0, 0)
-        centerline = painter_path(stroke["points"], stroke.get("width", 1))
-        self.setPath(painter_path(stroke["points"], stroke.get("width", 1), stroke["widths"]) if "widths" in stroke else centerline)
-        self.point_bounds = (QRectF(QPointF(*stroke["points"][0]), QPointF(*stroke["points"][0]))
-                             if len(stroke["points"]) == 1 else centerline.boundingRect())
-        stroker = QPainterPathStroker()
-        stroker.setWidth(stroke.get("width", 1))
-        stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
-        stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        self.hit_shape = self.path() if len(stroke["points"]) == 1 or "widths" in stroke else stroker.createStroke(self.path())
+        points = stroke["points"]
+        if not points:
+            raise ValueError("Stroke must contain at least one point")
+        width = stroke.get("width", 1)
+        variable = "widths" in stroke
+        # Fixed-width strokes need one path; variable-width strokes need an
+        # outline for rendering but only a cheap centerline bound for dragging.
+        self.setPath(painter_path(points, width, stroke["widths"] if variable else None))
+        if len(points) == 1:
+            self.point_bounds = QRectF(QPointF(*points[0]), QPointF(*points[0]))
+        else:
+            xs, ys = zip(*points)
+            self.point_bounds = QRectF(QPointF(min(xs), min(ys)), QPointF(max(xs), max(ys)))
+        if len(points) == 1 or variable:
+            self.hit_shape = self.path()
+        else:
+            stroker = QPainterPathStroker()
+            stroker.setWidth(width)
+            stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+            stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+            self.hit_shape = stroker.createStroke(self.path())
         self.highlighted = None
         self.highlight(False)
 
@@ -144,11 +160,11 @@ class NodeHandle(QGraphicsEllipseItem):
             self.canvas.move_node(self.index, value)
         return super().itemChange(change, value)
 
-    def mousePressEvent(self, event):
+    def mousePressEvent(self, event: QMouseEvent):
         self.before = self.canvas.strokes[self.canvas.selected_index]
         super().mousePressEvent(event)
 
-    def mouseReleaseEvent(self, event):
+    def mouseReleaseEvent(self, event: QMouseEvent):
         super().mouseReleaseEvent(event)
         before = self.before
         self.before = None
@@ -243,8 +259,26 @@ class ImageCanvas(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setMouseTracking(True)
-        self.viewport().setTabletTracking(True)
+        self._viewport().setTabletTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
+
+    def _viewport(self):
+        viewport = self.viewport()
+        if viewport is None:
+            raise RuntimeError("QGraphicsView viewport is not available")
+        return viewport
+
+    def _horizontal_bar(self):
+        scrollbar = self.horizontalScrollBar()
+        if scrollbar is None:
+            raise RuntimeError("Horizontal scrollbar is not available")
+        return scrollbar
+
+    def _vertical_bar(self):
+        scrollbar = self.verticalScrollBar()
+        if scrollbar is None:
+            raise RuntimeError("Vertical scrollbar is not available")
+        return scrollbar
 
     def reset_scene(self):
         self.erase_timer.stop()
@@ -285,7 +319,7 @@ class ImageCanvas(QGraphicsView):
     def load_image(self, image, strokes=None):
         self.reset_scene()
         self.image = image.copy()
-        self.strokes = copy.deepcopy(strokes or [])
+        self.strokes = copy.deepcopy([stroke for stroke in (strokes or []) if stroke.get("points")])
         self.image_item = self.graphics_scene.addPixmap(QPixmap.fromImage(self.image))
         self.graphics_scene.setSceneRect(QRectF(self.image.rect()))
         self.setSceneRect(QRectF(self.image.rect()))
@@ -370,8 +404,8 @@ class ImageCanvas(QGraphicsView):
     def ensure_pan_area(self):
         if self.image is None:
             return
-        center = self.mapToScene(self.viewport().rect().center())
-        visible = self.mapToScene(self.viewport().rect()).boundingRect()
+        center = self.mapToScene(self._viewport().rect().center())
+        visible = self.mapToScene(self._viewport().rect()).boundingRect()
         margin = max(visible.width(), visible.height(), self.image.width(), self.image.height()) * 2
         needed = visible.adjusted(-margin, -margin, margin, margin).united(QRectF(self.image.rect()))
         if not self.sceneRect().contains(visible.adjusted(-margin / 2, -margin / 2, margin / 2, margin / 2)):
@@ -387,7 +421,7 @@ class ImageCanvas(QGraphicsView):
             self.finish_drawing()
         self.finish_drag()
         self.finish_selection()
-        self.zoom_position = QPointF(position) if position is not None else QPointF(self.viewport().rect().center())
+        self.zoom_position = QPointF(position) if position is not None else QPointF(self._viewport().rect().center())
         self.zoom_anchor = self.scene_position(self.zoom_position)
         self.zoom_animation.setStartValue(self.transform().m11())
         self.zoom_animation.setEndValue(max(0.05, min(50, target * factor)))
@@ -402,7 +436,7 @@ class ImageCanvas(QGraphicsView):
         self.setTransformationAnchor(self.ViewportAnchor.NoAnchor)
         self.scale(factor, factor)
         self.ensure_pan_area()
-        center = self.scene_position(QPointF(self.viewport().rect().center()))
+        center = self.scene_position(QPointF(self._viewport().rect().center()))
         self.centerOn(center + self.zoom_anchor - self.scene_position(self.zoom_position))
         self.setTransformationAnchor(self.ViewportAnchor.AnchorUnderMouse)
         self.view_changed.emit()
@@ -430,7 +464,7 @@ class ImageCanvas(QGraphicsView):
         self.tool = tool
         self.finish_pan()
         self.update_handles()
-        self.viewport().update()
+        self._viewport().update()
 
     def select_strokes(self, identifiers):
         self.finish_stroke_animation()
@@ -448,7 +482,7 @@ class ImageCanvas(QGraphicsView):
         self.finish_stroke_animation()
         self.hover_endpoint = None
         self.cancel_drawing()
-        self.strokes = list(strokes)
+        self.strokes = [stroke for stroke in strokes if stroke.get("points")]
         self.selected_ids.clear()
         self.selected_index = -1
         self.update_view()
@@ -642,7 +676,7 @@ class ImageCanvas(QGraphicsView):
         return self.viewportTransform().inverted()[0].map(QPointF(position))
 
     def scene_point(self, position):
-        if self.image is None or not QRectF(self.viewport().rect()).contains(QPointF(position)):
+        if self.image is None or not QRectF(self._viewport().rect()).contains(QPointF(position)):
             return None
         point = self.scene_position(position)
         if not QRectF(self.image.rect()).contains(point):
@@ -711,6 +745,8 @@ class ImageCanvas(QGraphicsView):
             item = self.preview_items[chunk]
             points = points_to_draw[chunk * 128:chunk * 128 + 129]
             widths = widths_to_draw[chunk * 128:chunk * 128 + 129]
+            if not points or not widths:
+                continue
             variable = any(value != widths[0] for value in widths)
             item.setPath(painter_path(points, widths[0], widths if variable else None))
             color = QColor("#ff28b5")
@@ -901,8 +937,8 @@ class ImageCanvas(QGraphicsView):
     def pan_by(self, x, y):
         self.zoom_animation.stop()
         self.ensure_pan_area()
-        self.horizontalScrollBar().setValue(self.horizontalScrollBar().value() - round(x))
-        self.verticalScrollBar().setValue(self.verticalScrollBar().value() - round(y))
+        self._horizontal_bar().setValue(self._horizontal_bar().value() - round(x))
+        self._vertical_bar().setValue(self._vertical_bar().value() - round(y))
 
     def finish_pan(self):
         self.panning = False
@@ -950,7 +986,7 @@ class ImageCanvas(QGraphicsView):
                                                           QPen(QColor("#00b7ff"), 0), QBrush(QColor(0, 183, 255, 30)))
             self.rubber_item.setZValue(5)
 
-    def mouseMoveEvent(self, event):
+    def mouseMoveEvent(self, event: QMouseEvent):
         if self.keyboard_drawing:
             event = QMouseEvent(event.type(), event.position(), event.globalPosition(),
                                 Qt.MouseButton.NoButton, Qt.MouseButton.LeftButton, event.modifiers())
@@ -969,7 +1005,7 @@ class ImageCanvas(QGraphicsView):
             for identifier in self.selected_ids:
                 self.items_by_id[identifier].setPos(delta)
             return
-        if self.rubber_item is not None:
+        if self.rubber_item is not None and self.rubber_start is not None:
             point = self.clamp_point(self.scene_position(event.position()))
             self.rubber_item.setRect(QRectF(self.rubber_start, point).normalized())
             return
@@ -995,7 +1031,7 @@ class ImageCanvas(QGraphicsView):
                 return
         super().mouseReleaseEvent(event)
 
-    def mouseDoubleClickEvent(self, event):
+    def mouseDoubleClickEvent(self, event: QMouseEvent):
         if self.tool == "polyline" and event.button() == Qt.MouseButton.LeftButton:
             self.finish_drawing()
             return
@@ -1006,7 +1042,7 @@ class ImageCanvas(QGraphicsView):
         self.mousePressEvent(event)
 
     def viewportEvent(self, event):
-        if event.type() in (QEvent.Type.TabletPress, QEvent.Type.TabletMove, QEvent.Type.TabletRelease) and self.tool != "edit":
+        if isinstance(event, QTabletEvent) and event.type() in (QEvent.Type.TabletPress, QEvent.Type.TabletMove, QEvent.Type.TabletRelease) and self.tool != "edit":
             self.update_cursor(event.position())
             if event.type() == QEvent.Type.TabletPress:
                 self.setFocus()
@@ -1048,17 +1084,24 @@ class ImageCanvas(QGraphicsView):
 
     def update_cursor(self, position):
         previous = self.hover_endpoint
-        self.hover_endpoint = (self.endpoint_at(position) if position is not None and self.tool in ("draw", "polyline")
-                               and not self.current_points else None)
+        # During drawing, panning, selection and drag operations, endpoint
+        # queries provide no useful feedback, but can trigger scene hit tests.
+        can_hover_endpoint = (
+            position is not None and self.tool in ("draw", "polyline")
+            and not self.current_points and not self.panning
+            and self.drag_start is None and self.rubber_item is None
+            and not self.keyboard_drawing
+        )
+        self.hover_endpoint = self.endpoint_at(position) if can_hover_endpoint else None
         for endpoint in (previous, self.hover_endpoint):
             if endpoint is not None:
                 point = self.viewportTransform().map(QPointF(*endpoint[2]))
-                self.viewport().update(QRectF(point.x() - 12, point.y() - 12, 24, 24).toAlignedRect())
+                self._viewport().update(QRectF(point.x() - 12, point.y() - 12, 24, 24).toAlignedRect())
         if self.tool == "erase":
             radius = self.eraser_size / 2 + 2
             for point in (self.cursor_point, position):
                 if point is not None:
-                    self.viewport().update(QRectF(point.x() - radius, point.y() - radius, radius * 2, radius * 2).toAlignedRect())
+                    self._viewport().update(QRectF(point.x() - radius, point.y() - radius, radius * 2, radius * 2).toAlignedRect())
         self.cursor_point = position
 
     def hover_erase(self, position):
@@ -1097,14 +1140,14 @@ class ImageCanvas(QGraphicsView):
     def keyboard_click(self, pressed, modifiers=Qt.KeyboardModifier.NoModifier):
         if pressed == self.keyboard_drawing:
             return
-        position = self.viewport().mapFromGlobal(QCursor.pos())
-        if pressed and (not self.isEnabled() or not self.viewport().rect().contains(position)):
+        position = self._viewport().mapFromGlobal(QCursor.pos())
+        if pressed and (not self.isEnabled() or not self._viewport().rect().contains(position)):
             return
         self.keyboard_drawing = pressed
         event = QMouseEvent(QEvent.Type.MouseButtonPress if pressed else QEvent.Type.MouseButtonRelease,
                             QPointF(position), QPointF(QCursor.pos()), Qt.MouseButton.LeftButton,
                             Qt.MouseButton.LeftButton if pressed else Qt.MouseButton.NoButton, modifiers)
-        QApplication.sendEvent(self.viewport(), event)
+        QApplication.sendEvent(self._viewport(), event)
 
     def keyPressEvent(self, event):
         if self.pan_binding.count() and event.keyCombination() == self.pan_binding[0]:

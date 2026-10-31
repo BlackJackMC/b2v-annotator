@@ -1,9 +1,10 @@
 import copy
 from html import escape
 import math
+import time
 from PyQt6 import sip
 from PyQt6.QtCore import Qt, QPointF, QTimer, QEvent, QSettings, QVariantAnimation, QEasingCurve, QByteArray, QSize
-from PyQt6.QtGui import QCursor, QImage, QKeySequence, QMouseEvent, QPixmap, QShortcut, QPainter, QIcon
+from PyQt6.QtGui import QCursor, QImage, QKeySequence, QMouseEvent, QKeyEvent, QCloseEvent, QPixmap, QShortcut, QPainter, QIcon
 from PyQt6.QtSvg import QSvgRenderer
 from PyQt6.QtWidgets import (
     QApplication, QLineEdit, QTextEdit, QPlainTextEdit, QAbstractSpinBox, QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QListWidget,
@@ -13,7 +14,7 @@ from PyQt6.QtWidgets import (
 )
 from tasks.svg.canvas import ImageCanvas
 from tasks.svg.document import canvas_strokes, stroke_data, svg_text, validate_annotation
-from tasks.svg.service import TraceService, TaskWorker, LocalEditsConflict
+from tasks.svg.service import TraceService, TaskWorker, LocalEditsConflict, TaskConflict
 
 
 class SVGTaskScreen(QWidget):
@@ -29,6 +30,8 @@ class SVGTaskScreen(QWidget):
         self.busy = False
         self.job_blocking = False
         self.save_requested = False
+        self.acknowledged_conflicts = set()
+        self.last_interaction_at = time.monotonic()
         self.saving = False
         self.tool_menu = None
         self.loading = False
@@ -48,6 +51,9 @@ class SVGTaskScreen(QWidget):
         self.close_target = None
         self.settings = QSettings("board2vec", "annotator")
         self.stroke_list_dirty = True
+        self.stroke_refresh_timer = QTimer(self)
+        self.stroke_refresh_timer.setSingleShot(True)
+        self.stroke_refresh_timer.timeout.connect(self.refresh_stroke_list)
         self.click_keys = set()
         self.click_target = None
         self.dispatching_click = False
@@ -158,15 +164,14 @@ class SVGTaskScreen(QWidget):
         region_layout.addWidget(self.progress_label)
         region_layout.addWidget(QLabel("Processing / available"))
         self.region_list = QListWidget()
-        self.region_list.itemDoubleClicked.connect(self.on_region_clicked)
+        self.region_list.itemClicked.connect(self.on_region_clicked)
         region_layout.addWidget(self.region_list, stretch=1)
         region_layout.addWidget(QLabel("Done"))
         self.history_list = QListWidget()
         self.history_list.setIconSize(QSize(64, 44))
         self.history_list.setUniformItemSizes(True)
         self.history_list.verticalScrollBar().valueChanged.connect(lambda: self.thumbnail_timer.start(200))
-        self.history_list.itemDoubleClicked.connect(self.on_region_clicked)
-        self.history_list.itemClicked.connect(self.schedule_saved_preview)
+        self.history_list.itemClicked.connect(self.on_region_clicked)
         region_layout.addWidget(self.history_list, stretch=1)
         transfer = QHBoxLayout()
         self.copy_trace_button = QPushButton("Copy strokes")
@@ -739,6 +744,7 @@ class SVGTaskScreen(QWidget):
         if self.tabs.currentIndex() != 1 or not self.stroke_list_dirty:
             return
         self.stroke_list.blockSignals(True)
+        self.stroke_list.setUpdatesEnabled(False)
         while self.stroke_list.count() > len(self.canvas.strokes):
             self.stroke_list.takeItem(self.stroke_list.count() - 1)
         for index, stroke in enumerate(self.canvas.strokes):
@@ -749,17 +755,19 @@ class SVGTaskScreen(QWidget):
             item.setText(f"{index + 1}. {tool_name} | {len(stroke['points'])} nodes")
             item.setData(Qt.ItemDataRole.UserRole, stroke["id"])
             item.setSelected(stroke["id"] in self.canvas.selected_ids)
+        self.stroke_list.setUpdatesEnabled(True)
         self.stroke_list.blockSignals(False)
         self.stroke_list_dirty = False
 
     def on_strokes_changed(self):
         self.stroke_list_dirty = True
-        QTimer.singleShot(0, self.refresh_stroke_list)
+        self.stroke_refresh_timer.start(35)
         self.update_canvas_status()
         if not self.loading and self.document:
             self.mark_dirty()
 
     def mark_dirty(self, *args):
+        self.last_interaction_at = time.monotonic()
         if not self.loading and self.document:
             self.dirty = True
             key = self.binding_text("Save") or "Save & Next"
@@ -788,12 +796,20 @@ class SVGTaskScreen(QWidget):
             self.saving = False
             self.set_busy(False, block)
             if worker.error:
+                if isinstance(worker.exception, TaskConflict):
+                    # A different user may have claimed it after our last refresh.
+                    # Refresh the list in the next event-loop turn.
+                    QTimer.singleShot(0, self.refresh_statuses_only)
                 suffix = " Retry Save to finish the pending export." if self.service.export_pending is not None else " Your local drawing has been kept."
                 self.show_status(worker.error + suffix)
                 if worker.conflict_task is not None:
                     self.resolve_local_conflict(worker.conflict_task)
                 elif not quiet:
-                    QMessageBox.warning(self, "Tracing", worker.error)
+                    QMessageBox.warning(
+                        self,
+                        "Task already selected" if isinstance(worker.exception, TaskConflict) else "Tracing",
+                        worker.error,
+                    )
             else:
                 callback(worker.result)
             worker.deleteLater()
@@ -829,15 +845,23 @@ class SVGTaskScreen(QWidget):
         self.sync_timer.start(30000)
         self.manual_refresh()
 
+    def refresh_statuses_only(self):
+        """Refresh visible lock labels without automatically claiming any task."""
+        if not self.worker:
+            self.run_job(self.service.refresh, self.update_regions,
+                         "Checking task ownership…", quiet=True)
+
     def manual_refresh(self):
+        # Listing regions is read-only. Merely opening the Regions page or
+        # pressing Refresh must NEVER claim a task without a click.
         def refreshed(data):
             self.history_icons.clear()
             self.update_regions(data)
-            if self.current_task is None:
-                self.load_next_task()
         self.run_job(lambda: self.service.refresh(scan=True), refreshed, "Scanning AABB regions and checking status…")
 
     def update_regions(self, data=None):
+        self.region_list.setUpdatesEnabled(False)
+        self.history_list.setUpdatesEnabled(False)
         self.region_list.clear()
         self.history_list.clear()
         done = 0
@@ -846,6 +870,12 @@ class SVGTaskScreen(QWidget):
             status = st.get("status", "available")
             if status == "done":
                 label = f"[pending] {task['label']}" if st.get("pending_sync") else task["label"]
+            elif status == "expired":
+                label = f"[expired — claim] {task['label']}"
+            elif status == "processing" and st.get("locked_by") == self.service.user_id:
+                label = f"[claimed by you] {task['label']}"
+            elif status == "processing":
+                label = f"[claimed by another annotator] {task['label']}"
             else:
                 label = f"[{status}] {task['label']}"
             item = QListWidgetItem(label)
@@ -860,6 +890,8 @@ class SVGTaskScreen(QWidget):
                 self.region_list.addItem(item)
             if self.current_task and task["task_id"] == self.current_task["task_id"]:
                 item.setSelected(True)
+        self.region_list.setUpdatesEnabled(True)
+        self.history_list.setUpdatesEnabled(True)
         pending_count = len(self.service.pending_sync)
         pending_text = f" ({pending_count} pending sync)" if pending_count else ""
         self.progress_label.setText(f"Done: {done} / {len(self.service.tasks)}{pending_text}")
@@ -879,7 +911,7 @@ class SVGTaskScreen(QWidget):
 
     def load_next_task(self):
         if self.current_task:
-            self.status_label.setText("Save this region first, or double-click another region. Unsaved edits stay in memory when switching.")
+            self.status_label.setText("Save this region first, or click another region. Unsaved edits stay in memory when switching.")
             return
         self.run_job(self.service.next_region, self.set_current_task, "Claiming the next available region…", block=True)
 
@@ -887,9 +919,17 @@ class SVGTaskScreen(QWidget):
         self.loading = True
         try:
             if result:
+                self.last_interaction_at = time.monotonic()
                 self.current_task = result["task"]
                 self.document = result["document"]
                 self.crop_image = result["image"]
+                # Copy strokes remains available for a previously saved Done
+                # result after we successfully claim it. No extra Preview button.
+                self.saved_preview = {
+                    "task": self.current_task,
+                    "document": copy.deepcopy(self.document),
+                } if self.document.get("strokes") else None
+                self.copy_trace_button.setEnabled(self.saved_preview is not None)
                 self.canvas.load_image(self.crop_image, canvas_strokes(self.document))
                 self.context_label.setPixmap(QPixmap.fromImage(result["preview"]).scaled(
                     240, 96, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
@@ -901,12 +941,16 @@ class SVGTaskScreen(QWidget):
                 self.current_task = None
                 self.document = None
                 self.crop_image = None
+                self.saved_preview = None
+                self.copy_trace_button.setEnabled(False)
                 self.context_label.clear()
                 self.region_label.setText("No available regions")
                 self.canvas.show_empty_state()
                 self.update_regions()
-                self.status_label.setText("No available regions. Refresh inputs or double-click a completed region to edit.")
+                self.status_label.setText("No available regions. Refresh inputs or click a completed region to edit.")
             self.dirty = bool(result and result["task"]["task_id"] in self.service.pending)
+            if result is None:
+                self.update_regions()
             self.next_button.setVisible(result is None)
             self.save_button.setEnabled(result is not None)
             self.paste_trace_button.setEnabled(result is not None and self.copied_tracing is not None)
@@ -916,6 +960,15 @@ class SVGTaskScreen(QWidget):
     def on_region_clicked(self, item):
         self.preview_timer.stop()
         self.open_region(item.data(Qt.ItemDataRole.UserRole))
+
+    def preview_selected_history(self):
+        """Read-only preview is explicit; clicking a Done task claims it."""
+        item = self.history_list.currentItem()
+        if item is None:
+            self.show_status("Select a Done region to preview its saved strokes.")
+            return
+        self.preview_task = item.data(Qt.ItemDataRole.UserRole)
+        self.preview_saved_tracing()
 
     def schedule_saved_preview(self, item):
         self.thumbnail_timer.stop()
@@ -947,11 +1000,18 @@ class SVGTaskScreen(QWidget):
         if self.worker or self.preview_timer.isActive():
             self.thumbnail_timer.start(300)
             return
-        for row in range(self.history_list.count()):
+        viewport = self.history_list.viewport()
+        first = self.history_list.indexAt(viewport.rect().topLeft()).row()
+        last = self.history_list.indexAt(viewport.rect().bottomLeft()).row()
+        if first < 0:
+            first = 0
+        if last < 0:
+            last = min(self.history_list.count() - 1, first + 12)
+        for row in range(first, last + 1):
             item = self.history_list.item(row)
             task = item.data(Qt.ItemDataRole.UserRole)
-            if task["task_id"] not in self.history_icons and self.history_list.visualItemRect(item).intersects(self.history_list.viewport().rect()):
-                def load():
+            if task["task_id"] not in self.history_icons:
+                def load(task=task):
                     try:
                         document = self.service.local_document(task)
                         if document is not None:
@@ -960,7 +1020,7 @@ class SVGTaskScreen(QWidget):
                     except (RuntimeError, OSError, ValueError) as error:
                         return {"error": str(error)}
 
-                def loaded(result):
+                def loaded(result, task=task):
                     if "error" in result:
                         self.history_icons[task["task_id"]] = QIcon()
                     else:
@@ -1025,42 +1085,28 @@ class SVGTaskScreen(QWidget):
         self.show_status(f"Pasted {len(strokes)} strokes at their original image position. Ctrl+Z undoes this paste.")
 
     def resolve_local_conflict(self, task):
-        box = QMessageBox(self)
-        box.setWindowTitle("Saved result changed")
-        box.setText("This region has a newer server result. Choose which drawing to open. Keeping local edits will replace the server result only when you save.")
-        local = box.addButton("Keep local edits", QMessageBox.ButtonRole.AcceptRole)
-        server = box.addButton("Use server result", QMessageBox.ButtonRole.DestructiveRole)
-        box.addButton(QMessageBox.StandardButton.Cancel)
-        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
-        box.exec()
-        if box.clickedButton() in (local, server):
-            use_local = box.clickedButton() is local
-            QTimer.singleShot(0, lambda: self.open_region(task, use_local))
+        self.show_status("Task was taken or the lock expired. Your previous edits cannot be submitted.")
 
     def open_region(self, task, use_local=None):
         if self.worker or self.service.export_pending is not None:
             return
         if (self.current_task and self.current_task["task_id"] == task["task_id"] and use_local is None
-                and self.service.statuses.get(task["task_id"], {}).get("status") != "expired"):
+                and self.service.statuses.get(task["task_id"], {}).get("status") == "processing"
+                and self.service.statuses.get(task["task_id"], {}).get("locked_by") == self.service.user_id):
             return
         self.canvas.finish_drawing()
         previous = self.current_task
         document = self.snapshot() if previous else None
-        status = self.service.statuses.get(task["task_id"], {}).get("status")
 
         def switch():
             if previous:
                 self.service.remember(previous, document)
-            result = self.service.load_region(task, reopen=status == "done", use_local=use_local)
-            try:
-                if previous and previous["task_id"] != task["task_id"]:
-                    self.service.release(previous)
-            except Exception:
-                self.service.release(task)
-                raise
+            result = self.service.load_region(task, use_local=use_local)
+            # Keep ALL previously clicked tasks claimed in MongoDB.
+            # Switching the canvas must not unclaim the previous region.
             return result
 
-        self.run_job(switch, self.set_current_task, "Opening region…", block=True)
+        self.run_job(switch, self.set_current_task, "Claiming region on server…", block=True)
 
     def save_and_submit(self):
         if not self.current_task:
@@ -1076,28 +1122,27 @@ class SVGTaskScreen(QWidget):
             QMessageBox.warning(self, "Tracing", "No crop image is loaded.")
             return
         task = self.current_task
-
         def saved(result):
+            if not result["saved"]:
+                # Save did not complete: retain current task, drawing and local draft.
+                self.show_status(result.get("error", "Save not completed. Local drawing preserved."))
+                return
             self.history_icons.pop(task["task_id"], None)
             self.dirty = False
             self.set_current_task(result["next"])
             if result["error"]:
-                self.status_label.setText("Saved successfully. Could not open the next region: " + result["error"])
-            if result.get("conflict"):
-                self.resolve_local_conflict(result["conflict"])
+                self.status_label.setText("Saved locally. Could not open the next region: " + result["error"])
 
         def submit():
-            conflict = None
             try:
                 self.service.submit(task, document)
             except LocalEditsConflict as error:
-                conflict = error.task
+                return {"saved": False, "next": None, "error": str(error), "conflict": error.task}
+            # Other exceptions are handled by run_job and leave the screen intact.
             try:
-                return {"next": self.service.next_region(refresh=False), "error": "", "conflict": conflict}
-            except LocalEditsConflict as error:
-                return {"next": None, "error": str(error), "conflict": conflict or error.task}
+                return {"saved": True, "next": None, "error": "", "conflict": None}
             except Exception as error:
-                return {"next": None, "error": str(error), "conflict": conflict}
+                return {"saved": True, "next": None, "error": str(error), "conflict": None}
 
         self.saving = True
         self.run_job(submit, saved, "Saving JSON and SVG…", block=True)
@@ -1105,12 +1150,13 @@ class SVGTaskScreen(QWidget):
     def renew_lock(self):
         if self.worker or self.service.export_pending is not None:
             return
-        task = self.current_task
-        if task is None:
+        # Keep all clicked tasks leased while this screen is running.
+        # Do not silently drop previously claimed tasks after 5 minutes.
+        if not self.service.claimed_task_ids:
             self.run_job(self.service.refresh, self.update_regions, "Checking connection…", quiet=True)
             return
-        self.run_job(lambda: self.service.sync_lock(task), lambda result: self.update_regions(),
-                     "Renewing task lock…", quiet=True)
+        self.run_job(self.service.sync_lock, lambda result: self.update_regions(),
+                     "Renewing claimed task locks…", quiet=True)
 
     def stop_and_back(self):
         if self.worker or self.service.export_pending is not None:
@@ -1120,9 +1166,9 @@ class SVGTaskScreen(QWidget):
         document = self.snapshot() if task else None
 
         def release():
-            if task:
-                self.service.remember(task, document)
-                self.service.release(task)
+            # Do not unclaim previously clicked tasks when leaving this screen.
+            # They remain server-owned until submitted, explicitly released,
+            # or the lease expires.
             self.service.close()
 
         def finished(result):
@@ -1179,7 +1225,7 @@ class SVGTaskScreen(QWidget):
         if event.type() == QEvent.Type.ApplicationDeactivate:
             self.pointer_click(False)
             self.click_keys.clear()
-        if event.type() == QEvent.Type.MouseMove and self.click_target is not None and self.click_target is not self.canvas.viewport():
+        if isinstance(event, QMouseEvent) and event.type() == QEvent.Type.MouseMove and self.click_target is not None and self.click_target is not self.canvas.viewport():
             target = self.click_target
             if not sip.isdeleted(target):
                 self.dispatching_click = True
@@ -1190,7 +1236,7 @@ class SVGTaskScreen(QWidget):
                 finally:
                     self.dispatching_click = False
                 return True
-        if event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+        if isinstance(event, QKeyEvent) and event.type() in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
             if event.type() == QEvent.Type.KeyRelease and event.key() in self.click_keys:
                 if not event.isAutoRepeat():
                     self.click_keys.discard(event.key())
@@ -1218,7 +1264,7 @@ class SVGTaskScreen(QWidget):
                     self.pointer_click(True, event.modifiers())
                 event.accept()
                 return True
-        if watched is self.close_target and event.type() == QEvent.Type.Close:
+        if watched is self.close_target and isinstance(event, QCloseEvent) and event.type() == QEvent.Type.Close:
             if self.worker:
                 self.status_label.setText("Please wait for the current save or server request, then close again.")
                 event.ignore()
