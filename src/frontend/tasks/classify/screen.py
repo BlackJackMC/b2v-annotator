@@ -4,6 +4,7 @@ from typing import Dict, List
 import requests
 from PyQt6.QtCore import Qt, QTimer, QEvent
 from PyQt6.QtGui import QImage, QPainter, QPen, QColor, QPixmap, QKeySequence, QShortcut
+from core.homography import rectify_image
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QLabel, QPushButton, QListWidget, QListWidgetItem, QMessageBox
 from tasks.base.async_workflow import AsyncTaskWorkflow
 from core.api_client import APIClient
@@ -187,6 +188,8 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
         if strategy.image_info(Path(task["image_path"]))[2] != task["image_sha256"]:
             raise ValueError("The image changed. Refresh inputs before classifying it.")
         data = json.loads(Path(task["aabb_path"]).read_bytes())
+        if data.get("homography") != task.get("homography"):
+            raise ValueError("The AABB homography changed. Refresh inputs before classifying it.")
         box = data["boxes"][task["region_index"]]
         if [box[key] for key in ("x", "y", "w", "h")] != task["box"]:
             raise ValueError("The AABB changed. Refresh inputs before classifying it.")
@@ -205,9 +208,9 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
             else:
                 self.verify_source(task)
                 stat = Path(task["image_path"]).stat()
-                key = (task["image_path"], stat.st_size, stat.st_mtime_ns)
+                key = (task["image_path"], stat.st_size, stat.st_mtime_ns, json.dumps(task.get("homography"), sort_keys=True))
                 if key != self.source_key or self.source_image is None:
-                    self.source_image = QImage(task["image_path"])
+                    self.source_image = rectify_image(QImage(task["image_path"]), task.get("homography"))
                     self.source_key = key
                     self.source_preview = self.source_image.scaledToWidth(240) if not self.source_image.isNull() else None
                 original = self.source_image
@@ -216,6 +219,8 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
             crop = original.copy(*task["crop"])
             result = task.get("existing_result") or {}
             saved = result["points"][0] if result.get("points") else result
+            if result and saved.get("homography") != task.get("homography"):
+                raise ValueError("The saved label uses a different homography. Refresh inputs.")
             if saved.get("image_sha256", task["image_sha256"]) != task["image_sha256"]:
                 raise ValueError("The saved label uses an older source image. Use a new image name for a revised source.")
             if saved.get("crop", task["crop"]) != task["crop"]:
@@ -254,8 +259,10 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
             return
         task = self.current_task
         task_id = task["task_id"]
-        self.async_save([{"label": self.selected_label,
-                          "image_sha256": task["image_sha256"], "crop": task["crop"]}])
+        label = {"label": self.selected_label, "image_sha256": task["image_sha256"], "crop": task["crop"]}
+        if task.get("homography") is not None:
+            label["homography"] = task["homography"]
+        self.async_save([label])
         self.load_next_task(after_task_id=task_id)
 
     def confirm_switch(self):
