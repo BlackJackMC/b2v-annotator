@@ -26,4 +26,6 @@ class ClassifyStrategy(TaskStrategy):
             source = task.pop("source")
             task.update(image=source["image"], image_sha256=source["image_sha256"],
                         region_index=source["region_index"], box=source["region_xywh"], crop=source["crop_xywh"])
+            if source.get("homography") is not None:
+                task["homography"] = source["homography"]
         return tasks

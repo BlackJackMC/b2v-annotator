@@ -5,6 +5,7 @@ from typing import Dict, List
 from PyQt6.QtGui import QImageReader
 from tasks.base.strategy import TaskStrategy
 from tasks.svg.geometry import crop_bounds
+from core.homography import homography_transform
 
 
 def read_image_info(path, cache):
@@ -70,6 +71,15 @@ def scan_regions(config_dict, image_cache, errors, task_type):
             data = json.loads(content)
             if not isinstance(data, dict) or not isinstance(data.get("boxes"), list):
                 raise ValueError("Expected an AABB JSON containing a boxes list.")
+            homography = data.get("homography")
+            image_size = [info["width"], info["height"]]
+            suffix = ""
+            if homography is not None:
+                homography_transform(homography)
+                if homography["source_size"] != image_size:
+                    raise ValueError("Homography does not match the source image dimensions.")
+                image_size = homography["size"]
+                suffix = "_rectified"
             aabb_hash = hashlib.sha256(content).hexdigest()
             name = "".join(character if character.isalnum() or character == "_" else
                            "--" if character == "/" else "-s" if character == " " else
@@ -77,23 +87,25 @@ def scan_regions(config_dict, image_cache, errors, task_type):
                            for character in f"{dataset}/{relative.with_suffix('').as_posix()}")
             for index, box in enumerate(data["boxes"]):
                 try:
-                    crop = crop_bounds(box, info["width"], info["height"])
+                    crop = crop_bounds(box, *image_size)
                     source = {
                         "image": image_path.relative_to(keyframes_dir).as_posix(),
                         "image_sha256": info["sha256"],
-                        "image_size": [info["width"], info["height"]],
+                        "image_size": image_size,
                         "aabb": relative.as_posix(),
                         "aabb_sha256": aabb_hash,
                         "region_index": index,
                         "region_xywh": [float(box[k]) for k in ("x", "y", "w", "h")],
                         "crop_xywh": crop
                     }
+                    if homography is not None:
+                        source["homography"] = homography
                     tasks.append({
-                        "task_id": f"{name}--region_{index + 1:04d}--{task_type}",
+                        "task_id": f"{name}--region_{index + 1:04d}{suffix}--{task_type}",
                         "label": f"{relative.with_suffix('').as_posix()} / region {index + 1}",
                         "image_path": str(image_path),
                         "aabb_path": str(json_file),
-                        "output_path": str(output_dir.joinpath(*output_parts) / f"region_{index + 1:04d}.json"),
+                        "output_path": str(output_dir.joinpath(*output_parts) / f"region_{index + 1:04d}{suffix}.json"),
                         "source": source
                     })
                 except (ValueError, KeyError, TypeError, OverflowError) as error:

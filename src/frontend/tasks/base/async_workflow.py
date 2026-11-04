@@ -20,6 +20,7 @@ from tasks.svg.document import atomic_write
 class AsyncTaskWorkflow:
     def initialize_async_workflow(self):
         self._network_lane = BackgroundLane(self)
+        self._status_lane = BackgroundLane(self)
         # Claims run independently of the Save/Submit network queue.
         self._claim_lane = BackgroundLane(self)
         self._file_lane = BackgroundLane(self)
@@ -32,11 +33,15 @@ class AsyncTaskWorkflow:
         self._failed_saves = {}  # in-memory fallback if even the disk write fails
         self._last_activity = time.monotonic()
         self._last_list_signature = None
+        self._image_cache = {}
+        self._renewing_tasks = set()
         self._shutting_down = False
         self._network_lane.completed.connect(self._task_job_completed)
+        self._status_lane.completed.connect(self._task_job_completed)
         self._claim_lane.completed.connect(self._task_job_completed)
         self._file_lane.completed.connect(self._task_job_completed)
         self._network_lane.start()
+        self._status_lane.start()
         self._claim_lane.start()
         self._file_lane.start()
         self._renew_timer = QTimer(self)
@@ -62,6 +67,7 @@ class AsyncTaskWorkflow:
         job_id = self._job_number
         self._callbacks[job_id] = (done, failed)
         worker = (self._claim_lane if lane == "claim" else
+                  self._status_lane if lane == "status" else
                   self._network_lane if lane == "network" else self._file_lane)
         worker.submit(job_id, function, priority=priority)
 
@@ -83,10 +89,11 @@ class AsyncTaskWorkflow:
             self.status_label.setText("Background callback failed: " + str(exc))
 
     def _server_state(self, tid, status, owner=None, result=None):
-        self.data_manager.status_cache.setdefault(self.task_type, {})[tid] = {
-            "task_id": tid, "status": status, "locked_by": owner,
-            "result": result,
-        }
+        with self.data_manager._lock:
+            self.data_manager.status_cache.setdefault(self.task_type, {})[tid] = {
+                "task_id": tid, "status": status, "locked_by": owner,
+                "result": result,
+            }
         self.sync_data()
 
     def async_refresh(self, scan=False):
@@ -105,7 +112,7 @@ class AsyncTaskWorkflow:
             def failed(exc):
                 self._refreshing = False
                 self.status_label.setText("Could not refresh task status: " + str(exc))
-            self._enqueue("network", lambda: self.data_manager.refresh_statuses(self.task_type), done, failed)
+            self._enqueue("status", lambda: self.data_manager.refresh_statuses(self.task_type), done, failed)
         if scan:
             self._enqueue("file", lambda: self.data_manager.scan_local_folder(self.task_type), fetch,
                           lambda exc: (setattr(self, "_refreshing", False),
@@ -180,18 +187,28 @@ class AsyncTaskWorkflow:
         # QImage/QImageReader are usable in a worker; QPixmap/QWidget are not.
         if self.task_type == "classify":
             strategy = self.data_manager.strategies[self.task_type]
-            from pathlib import Path
-            import json
             if strategy.image_info(Path(task["image_path"]))[2] != task["image_sha256"]:
                 raise ValueError("The source image has changed; refresh inputs.")
             source = json.loads(Path(task["aabb_path"]).read_bytes())
+            if source.get("homography") != task.get("homography"):
+                raise ValueError("The source homography has changed; refresh inputs.")
             box = source["boxes"][task["region_index"]]
             if [box[k] for k in ("x", "y", "w", "h")] != task["box"]:
                 raise ValueError("The source AABB has changed; refresh inputs.")
-        reader = QImageReader(str(task["image_path"]))
-        image = reader.read()
-        if image.isNull():
-            raise ValueError("Cannot decode selected image: " + reader.errorString())
+        image_path = Path(task["image_path"])
+        stat = image_path.stat()
+        cache_key = (str(image_path), stat.st_size, stat.st_mtime_ns)
+        image = self._image_cache.get(cache_key)
+        if image is None:
+            reader = QImageReader(str(image_path))
+            image = reader.read()
+            if image.isNull():
+                raise ValueError("Cannot decode selected image: " + reader.errorString())
+            while self._image_cache and (len(self._image_cache) >= 2 or
+                    sum(value.sizeInBytes() for value in self._image_cache.values()) + image.sizeInBytes() > 64 * 1024 * 1024):
+                self._image_cache.pop(next(iter(self._image_cache)))
+            if image.sizeInBytes() <= 64 * 1024 * 1024:
+                self._image_cache[cache_key] = image
         if self.task_type == "aabb" and task.get("crop_coords"):
             from PyQt6.QtCore import Qt, QPointF
             from PyQt6.QtGui import QPainter, QPolygonF, QPainterPath, QImage
@@ -212,6 +229,7 @@ class AsyncTaskWorkflow:
             finally:
                 painter.end()
             image = {"pre_cropped": True, "image": cropped,
+                     "source_image": image,
                      "full_size": (image.width(), image.height()),
                      "offset": (rect.x(), rect.y())}
         pending_result = None
@@ -223,6 +241,18 @@ class AsyncTaskWorkflow:
                     pending_result = pending.get("result")
             except (OSError, ValueError, TypeError):
                 pass
+        if self.task_type == "aabb":
+            result = pending_result or task.get("existing_result") or {}
+            if result.get("homography") is not None:
+                from core.homography import rectify_image
+                original = image["source_image"] if isinstance(image, dict) else image
+                if not isinstance(image, dict):
+                    image = {"source_image": original}
+                image["rectified"] = rectify_image(original, result["homography"])
+                image["rectified_homography"] = result["homography"]
+        if self.task_type == "classify" and task.get("homography") is not None:
+            from core.homography import rectify_image
+            image = rectify_image(image, task["homography"])
         return image, pending_result
 
     def confirm_unsaved_switch(self):
@@ -232,7 +262,9 @@ class AsyncTaskWorkflow:
             return True
         points = self.canvas.get_coordinates()
         previous = (self.current_task.get("existing_result") or {}).get("points", [])
-        if points and points != previous:
+        space_changed = (hasattr(self, "homography") and
+                         self.homography != (self.current_task.get("existing_result") or {}).get("homography"))
+        if points != previous or (points and space_changed):
             choice = QMessageBox.question(
                 self, "Unsaved annotation", "Discard unsaved changes and switch?",
                 QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
@@ -259,6 +291,12 @@ class AsyncTaskWorkflow:
         self.sync_data()
         self.status_label.setText("Claiming task on server…")
         def claimed(opened):
+            if opened.get("_cancelled"):
+                self._claiming.discard(tid)
+                with self.data_manager._lock:
+                    self.data_manager.claiming_tasks.discard(tid)
+                self.sync_data()
+                return
             # Auto Next is read-only verified before claim, then checked again
             # using the atomic claim response. The legacy backend permits
             # claiming Done, so pre-check alone is not enough.
@@ -321,6 +359,8 @@ class AsyncTaskWorkflow:
                                     "Cannot claim this task. It may already belong to another annotator.\n" + str(exc))
             self.async_refresh()
         def verified_claim():
+            if request_number != self._select_number:
+                return {"_cancelled": True}
             if auto_next:
                 # A successful response with no row means never claimed.
                 rows = self.api.check_status([tid], raise_on_error=True, include_results=True)
@@ -382,7 +422,7 @@ class AsyncTaskWorkflow:
         tid = task["task_id"]
         if tid in self._saving:
             return
-        result = {"points": copy.deepcopy(points)}
+        result = copy.deepcopy(points) if isinstance(points, dict) else {"points": copy.deepcopy(points)}
         self._saving.add(tid)
         with self.data_manager._lock:
             self.data_manager.active_saves.add(tid)
@@ -393,6 +433,10 @@ class AsyncTaskWorkflow:
         self.status_label.setText("Saving " + tid + " in background…")
         pending_path = self._pending_path(task)
         def prepare():
+            if self.task_type == "aabb" and task.get("obb_path"):
+                current_board = json.loads(Path(task["obb_path"]).read_bytes()).get("board_obb")
+                if current_board != task.get("crop_coords"):
+                    raise ValueError("The source OBB changed. Refresh inputs before saving these boxes.")
             pending = {"task_id": tid, "task_type": self.task_type,
                        "user_id": self.api.user_id, "result": result}
             pending_path.parent.mkdir(parents=True, exist_ok=True)
@@ -400,6 +444,7 @@ class AsyncTaskWorkflow:
             # Recovery only: do not publish a completed output before MongoDB confirms.
             return True
         def file_ready(_):
+            self.status_label.setText("Local recovery saved; waiting for server: " + tid)
             # Do not auto-claim/reclaim during Save: ownership was acquired on click.
             self._enqueue("network", lambda: self._submit_with_verification(tid, result),
                           remote_done, save_error, priority=1)
@@ -412,7 +457,8 @@ class AsyncTaskWorkflow:
                 if self.data_manager.local_locks.get(self.task_type) == tid:
                     self.data_manager.local_locks.pop(self.task_type, None)
             self._failed_saves.pop(tid, None)
-            self._server_state(tid, "done", None)
+            self._saving.discard(tid)
+            self._server_state(tid, "done", None, result)
             self.status_label.setText("Saved to MongoDB: " + tid)
             # Acknowledged result supersedes any older legacy pending-queue entry.
             old_queue = self.data_manager.pending_sync.get(self.task_type, {})
@@ -437,8 +483,6 @@ class AsyncTaskWorkflow:
                 self.status_label.setText(
                     "Saved to MongoDB but local export failed. Recovery retained: " + str(exc))
             self._enqueue("file", export_local, exported, export_failed, priority=1)
-            self._saving.discard(tid)
-            self.sync_data()
         def save_error(exc):
             with self.data_manager._lock:
                 self.data_manager.active_saves.discard(tid)
@@ -483,16 +527,33 @@ class AsyncTaskWorkflow:
                if tid not in self._saving and tid not in self._claiming]
         if not ids:
             return
-        def completed(renewed_ids):
-            lost = set(ids) - set(renewed_ids)
-            if lost:
-                for tid in lost:
-                    self._claimed_tasks.pop(tid, None)
-                self.status_label.setText(f"Lost or expired {len(lost)} task lock(s); refreshing status.")
-                self.async_refresh()
-        self._enqueue("network", lambda: self.api.renew_tasks(ids, self.task_type),
-                      completed, lambda exc: self.status_label.setText("Lease renewal failed: " + str(exc)),
-                      priority=2)
+        batch = {"failed": False}
+        for tid in ids:
+            if tid in self._renewing_tasks:
+                continue
+            self._renewing_tasks.add(tid)
+
+            def renew(task_id=tid):
+                if batch["failed"] or task_id not in self._claimed_tasks or task_id in self._saving:
+                    return None
+                try:
+                    return self.api.renew_tasks([task_id], self.task_type)
+                except Exception:
+                    batch["failed"] = True
+                    raise
+
+            def completed(renewed_ids, task_id=tid):
+                self._renewing_tasks.discard(task_id)
+                if renewed_ids is not None and task_id not in renewed_ids:
+                    self._claimed_tasks.pop(task_id, None)
+                    self.status_label.setText("Lost or expired task lock: " + task_id)
+                    self.async_refresh()
+
+            def failed(error, task_id=tid):
+                self._renewing_tasks.discard(task_id)
+                self.status_label.setText("Lease renewal failed: " + str(error))
+
+            self._enqueue("network", renew, completed, failed, priority=2)
 
     def async_back(self):
         if not self.confirm_unsaved_switch():
@@ -520,5 +581,5 @@ class AsyncTaskWorkflow:
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        for lane in (self._network_lane, self._claim_lane, self._file_lane):
+        for lane in (self._network_lane, self._status_lane, self._claim_lane, self._file_lane):
             lane.stop_after_jobs()
