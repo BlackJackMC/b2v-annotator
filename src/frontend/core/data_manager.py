@@ -198,6 +198,7 @@ class DataManager:
         with self._lock:
             tasks = list(self.cached_tasks.get(task_type, []))
             self.status_cache.setdefault(task_type, {})
+            before_refresh = dict(self.status_cache[task_type])
         if not tasks:
             if refresh and not self.api.online:
                 try:
@@ -216,7 +217,9 @@ class DataManager:
                 new_cache.update({item["task_id"]: item for item in remote_list})
                 with self._lock:
                     cache = self.status_cache.setdefault(task_type, {})
-                    cache.clear()
+                    for tid in task_ids:
+                        if cache.get(tid) is not before_refresh.get(tid):
+                            new_cache[tid] = cache[tid]
                     cache.update(new_cache)
                 # Only an explicit server 'available' can invalidate local exports.
                 # Do not delete on offline/unknown statuses or active/pending saves.
@@ -230,6 +233,8 @@ class DataManager:
                 with self._lock:
                     cache = self.status_cache.setdefault(task_type, {})
                     for tid in task_ids:
+                        if cache.get(tid) is not before_refresh.get(tid):
+                            continue
                         previous = cache.get(tid, {})
                         cache[tid] = {"task_id": tid, "status": "unknown",
                                       "locked_by": previous.get("locked_by"),

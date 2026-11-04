@@ -20,6 +20,7 @@ from tasks.svg.document import atomic_write
 class AsyncTaskWorkflow:
     def initialize_async_workflow(self):
         self._network_lane = BackgroundLane(self)
+        self._status_lane = BackgroundLane(self)
         # Claims run independently of the Save/Submit network queue.
         self._claim_lane = BackgroundLane(self)
         self._file_lane = BackgroundLane(self)
@@ -36,9 +37,11 @@ class AsyncTaskWorkflow:
         self._renewing_tasks = set()
         self._shutting_down = False
         self._network_lane.completed.connect(self._task_job_completed)
+        self._status_lane.completed.connect(self._task_job_completed)
         self._claim_lane.completed.connect(self._task_job_completed)
         self._file_lane.completed.connect(self._task_job_completed)
         self._network_lane.start()
+        self._status_lane.start()
         self._claim_lane.start()
         self._file_lane.start()
         self._renew_timer = QTimer(self)
@@ -64,6 +67,7 @@ class AsyncTaskWorkflow:
         job_id = self._job_number
         self._callbacks[job_id] = (done, failed)
         worker = (self._claim_lane if lane == "claim" else
+                  self._status_lane if lane == "status" else
                   self._network_lane if lane == "network" else self._file_lane)
         worker.submit(job_id, function, priority=priority)
 
@@ -85,10 +89,11 @@ class AsyncTaskWorkflow:
             self.status_label.setText("Background callback failed: " + str(exc))
 
     def _server_state(self, tid, status, owner=None, result=None):
-        self.data_manager.status_cache.setdefault(self.task_type, {})[tid] = {
-            "task_id": tid, "status": status, "locked_by": owner,
-            "result": result,
-        }
+        with self.data_manager._lock:
+            self.data_manager.status_cache.setdefault(self.task_type, {})[tid] = {
+                "task_id": tid, "status": status, "locked_by": owner,
+                "result": result,
+            }
         self.sync_data()
 
     def async_refresh(self, scan=False):
@@ -107,7 +112,7 @@ class AsyncTaskWorkflow:
             def failed(exc):
                 self._refreshing = False
                 self.status_label.setText("Could not refresh task status: " + str(exc))
-            self._enqueue("network", lambda: self.data_manager.refresh_statuses(self.task_type), done, failed)
+            self._enqueue("status", lambda: self.data_manager.refresh_statuses(self.task_type), done, failed)
         if scan:
             self._enqueue("file", lambda: self.data_manager.scan_local_folder(self.task_type), fetch,
                           lambda exc: (setattr(self, "_refreshing", False),
@@ -439,6 +444,7 @@ class AsyncTaskWorkflow:
             # Recovery only: do not publish a completed output before MongoDB confirms.
             return True
         def file_ready(_):
+            self.status_label.setText("Local recovery saved; waiting for server: " + tid)
             # Do not auto-claim/reclaim during Save: ownership was acquired on click.
             self._enqueue("network", lambda: self._submit_with_verification(tid, result),
                           remote_done, save_error, priority=1)
@@ -451,7 +457,8 @@ class AsyncTaskWorkflow:
                 if self.data_manager.local_locks.get(self.task_type) == tid:
                     self.data_manager.local_locks.pop(self.task_type, None)
             self._failed_saves.pop(tid, None)
-            self._server_state(tid, "done", None)
+            self._saving.discard(tid)
+            self._server_state(tid, "done", None, result)
             self.status_label.setText("Saved to MongoDB: " + tid)
             # Acknowledged result supersedes any older legacy pending-queue entry.
             old_queue = self.data_manager.pending_sync.get(self.task_type, {})
@@ -476,8 +483,6 @@ class AsyncTaskWorkflow:
                 self.status_label.setText(
                     "Saved to MongoDB but local export failed. Recovery retained: " + str(exc))
             self._enqueue("file", export_local, exported, export_failed, priority=1)
-            self._saving.discard(tid)
-            self.sync_data()
         def save_error(exc):
             with self.data_manager._lock:
                 self.data_manager.active_saves.discard(tid)
@@ -576,5 +581,5 @@ class AsyncTaskWorkflow:
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        for lane in (self._network_lane, self._claim_lane, self._file_lane):
+        for lane in (self._network_lane, self._status_lane, self._claim_lane, self._file_lane):
             lane.stop_after_jobs()
