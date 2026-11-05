@@ -278,6 +278,10 @@ class AsyncTaskWorkflow:
         tid = task["task_id"]
         if tid in self._saving or tid in self._claiming:
             return
+        with self.data_manager._lock:
+            if tid in self.data_manager.active_saves:
+                self.status_label.setText("Server saved; finishing local export before reopening this task.")
+                return
         if self.current_task and self.current_task["task_id"] == tid:
             return
         if not self.confirm_unsaved_switch():
@@ -433,7 +437,7 @@ class AsyncTaskWorkflow:
         self.status_label.setText("Saving " + tid + " in background…")
         pending_path = self._pending_path(task)
         def prepare():
-            if self.task_type == "aabb" and task.get("obb_path"):
+            if self.task_type in ("aabb", "polygon") and task.get("obb_path"):
                 current_board = json.loads(Path(task["obb_path"]).read_bytes()).get("board_obb")
                 if current_board != task.get("crop_coords"):
                     raise ValueError("The source OBB changed. Refresh inputs before saving these boxes.")
