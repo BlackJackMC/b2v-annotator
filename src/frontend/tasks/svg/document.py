@@ -6,6 +6,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from tasks.svg.geometry import stroke_outline
+from core.homography import homography_transform
 
 
 def stroke_data(stroke, clone=False):
@@ -19,7 +20,7 @@ def stroke_data(stroke, clone=False):
 
 
 def new_annotation(task, user_id):
-    return {
+    result = {
         "version": 2,
         "task_id": task["task_id"],
         "image": task["source"]["image"],
@@ -29,10 +30,15 @@ def new_annotation(task, user_id):
         "annotator": user_id,
         "strokes": []
     }
+    if task["source"].get("homography") is not None:
+        result["homography"] = copy.deepcopy(task["source"]["homography"])
+    return result
 
 
 def compact_annotation(data, task, user_id):
     result = new_annotation(task, user_id)
+    if data.get("homography") != result.get("homography"):
+        raise ValueError("The saved tracing uses a different homography. Refresh or use a separate output folder.")
     if data.get("image_sha256", result["image_sha256"]) != result["image_sha256"]:
         raise ValueError("The saved tracing uses an older source image. Use a new image name for a revised source.")
     if data.get("schema_version") == "board2vec.trace.v1":
@@ -57,6 +63,10 @@ def canvas_strokes(data):
 
 
 def validate_annotation(data, task=None, complete=False):
+    if data.get("homography") is not None:
+        homography_transform(data["homography"])
+    if task and data.get("homography") != task["source"].get("homography"):
+        raise ValueError("This tracing uses a different homography.")
     if data.get("version") != 2:
         raise ValueError("Unsupported tracing JSON version.")
     for key in ("task_id", "image", "annotator"):

@@ -49,6 +49,7 @@ class AABBStrategy(TaskStrategy):
                     "video_name": video_name,
                     "frame": frame,
                     "image_path": str(img_path),
+                    "obb_path": str(json_file),
                     "crop_coords": obb_coords,
                     "output_path": str(output_dir / video_name / f"{frame}.json")
                 })

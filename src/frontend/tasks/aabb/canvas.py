@@ -1,3 +1,4 @@
+import math
 from typing import List, Dict
 from PyQt6.QtWidgets import QGraphicsView, QGraphicsScene, QGraphicsRectItem, QGraphicsTextItem
 from PyQt6.QtCore import Qt, QPoint, QPointF, pyqtSignal
@@ -79,14 +80,24 @@ class BoundingBox(QGraphicsRectItem):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if not self.canvas.is_editable or self.canvas.image_item is None:
+            return
+        bounds = self.canvas.image_item.boundingRect()
         if self.mode == "moving":
             delta = event.scenePos() - self.drag_start_pos
-            self.setPos(self.original_item_pos + delta)
+            target = self.original_item_pos + delta
+            rect = self.rect()
+            target.setX(max(bounds.left() - rect.left(), min(target.x(), bounds.right() - rect.right())))
+            target.setY(max(bounds.top() - rect.top(), min(target.y(), bounds.bottom() - rect.bottom())))
+            self.setPos(target)
             event.accept()
             return
             
         elif self.mode == "resizing":
-            delta = event.scenePos() - self.drag_start_pos
+            position = event.scenePos()
+            position.setX(max(bounds.left(), min(position.x(), bounds.right())))
+            position.setY(max(bounds.top(), min(position.y(), bounds.bottom())))
+            delta = position - self.drag_start_pos
             r = self.original_rect
             x, y, w, h = r.x(), r.y(), r.width(), r.height()
             
@@ -112,7 +123,12 @@ class BoundingBox(QGraphicsRectItem):
                 if new_h > 10:
                     h = new_h
                     
-            self.setRect(x, y, w, h)
+            left = max(x, bounds.left() - self.pos().x())
+            top = max(y, bounds.top() - self.pos().y())
+            right = min(x + w, bounds.right() - self.pos().x())
+            bottom = min(y + h, bounds.bottom() - self.pos().y())
+            if right > left and bottom > top:
+                self.setRect(left, top, right - left, bottom - top)
             event.accept()
             return
             
@@ -136,6 +152,8 @@ class ImageCanvas(QGraphicsView):
         self.crop_offset_x = 0
         self.crop_offset_y = 0
         self.copied_boxes = []
+        self.coordinate_space = None
+        self.copied_coordinate_space = None
         self.copied_image_size = None
         self.image_size = None
         self.setToolTip("Ctrl+A: select all boxes. Ctrl+C: copy selection. Ctrl+V: paste at the original image coordinates.")
@@ -143,7 +161,7 @@ class ImageCanvas(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         
         self._is_panning = False
         self._pan_start = QPoint()
@@ -171,6 +189,8 @@ class ImageCanvas(QGraphicsView):
         item = self.itemAt(event.pos())
         if event.button() == Qt.MouseButton.LeftButton:
             if item == self.image_item or item is None:
+                if self.image_item is None or not self.image_item.boundingRect().contains(self.mapToScene(event.pos())):
+                    return
                 self._is_drawing = True
                 self._draw_start_pos = self.mapToScene(event.pos())
                 
@@ -236,6 +256,9 @@ class ImageCanvas(QGraphicsView):
     def keyPressEvent(self, event):
         if not self.is_editable:
             return super().keyPressEvent(event)
+        if self._is_drawing:
+            event.accept()
+            return
         if event.matches(QKeySequence.StandardKey.SelectAll):
             for box in self.boxes:
                 box.setSelected(True)
@@ -246,6 +269,7 @@ class ImageCanvas(QGraphicsView):
             if selected and not self._is_drawing:
                 self.copied_boxes = selected
                 self.copied_image_size = self.image_size
+                self.copied_coordinate_space = self.coordinate_space
                 self.message.emit(f"Copied {len(selected)} boxes.")
             event.accept()
             return
@@ -263,13 +287,19 @@ class ImageCanvas(QGraphicsView):
         super().keyPressEvent(event)
 
     def paste_boxes(self):
-        if not self.copied_boxes or self._is_drawing:
+        if not self.is_editable or self.image_item is None or not self.copied_boxes or self._is_drawing:
+            return
+        if self.coordinate_space != self.copied_coordinate_space:
+            self.message.emit("Cannot paste between different homography coordinate spaces.")
             return
         if self.image_size != self.copied_image_size:
             self.message.emit("Cannot paste: image dimensions differ. Coordinates were not changed.")
             return
         rect = self.image_item.boundingRect()
         for box in self.copied_boxes:
+            if any(type(box.get(k)) not in (int, float) or not math.isfinite(box[k]) for k in ("x", "y", "w", "h")) or box["w"] <= 0 or box["h"] <= 0:
+                self.message.emit("Cannot paste invalid box coordinates.")
+                return
             x, y = box["x"] - self.crop_offset_x, box["y"] - self.crop_offset_y
             if x < 0 or y < 0 or x + box["w"] > rect.width() or y + box["h"] > rect.height():
                 self.message.emit("Cannot paste: a box lies outside this crop. No boxes were added.")
@@ -283,6 +313,7 @@ class ImageCanvas(QGraphicsView):
         self.message.emit(f"Pasted {len(self.copied_boxes)} boxes at their original image coordinates.")
 
     def show_empty_state(self):
+        self.reset_interaction()
         self.scene.clear()
         self.image_item = None
         self.boxes.clear()
@@ -300,6 +331,7 @@ class ImageCanvas(QGraphicsView):
         self.setSceneRect(text_item.boundingRect())
 
     def load_image(self, image_path, crop_coords=None):
+        self.reset_interaction()
         self.scene.clear()
         self.boxes.clear()
         self.is_editable = True
@@ -344,9 +376,10 @@ class ImageCanvas(QGraphicsView):
         self.image_item = self.scene.addPixmap(pixmap)
         margin = max(pixmap.width(), pixmap.height())
         self.setSceneRect(-margin, -margin, pixmap.width() + 2 * margin, pixmap.height() + 2 * margin)
-        self.centerOn(self.image_item)
+        self.centerOn(self.image_item.sceneBoundingRect().center())
 
     def load_existing_points(self, points_data: List[Dict]):
+        self.reset_interaction()
         for box in self.boxes:
             self.scene.removeItem(box)
         self.boxes.clear()
@@ -355,6 +388,26 @@ class ImageCanvas(QGraphicsView):
             box = BoundingBox(b_data["x"] - self.crop_offset_x, b_data["y"] - self.crop_offset_y, b_data["w"], b_data["h"], self)
             self.scene.addItem(box)
             self.boxes.append(box)
+
+    def reset_interaction(self):
+        self._is_drawing = False
+        self._current_box = None
+        self._draw_start_pos = None
+        self._is_panning = False
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+
+    def valid_coordinates(self, points):
+        if self.image_item is None or self._is_drawing:
+            return False
+        bounds = self.image_item.boundingRect().translated(self.crop_offset_x, self.crop_offset_y)
+        for box in points:
+            if any(type(box.get(k)) not in (int, float) or not math.isfinite(box[k]) for k in ("x", "y", "w", "h")):
+                return False
+            if (box["w"] <= 0 or box["h"] <= 0 or box["x"] < bounds.left() - 1e-6 or
+                    box["y"] < bounds.top() - 1e-6 or box["x"] + box["w"] > bounds.right() + 1e-6 or
+                    box["y"] + box["h"] > bounds.bottom() + 1e-6):
+                return False
+        return True
 
     def get_coordinates(self) -> List[Dict]:
         result = []

@@ -8,6 +8,7 @@ from pathlib import Path
 import requests
 from PyQt6.QtCore import QThread
 from PyQt6.QtGui import QImage, QPainter, QPen, QColor
+from core.homography import rectify_image
 from tasks.svg.document import (
     new_annotation, compact_annotation, validate_annotation,
     prepare_export, write_export, atomic_write
@@ -468,6 +469,8 @@ class TraceService:
             data = json.loads(aabb.read_bytes())
             self._source_validation_cache[aabb_signature] = data
         index = task["source"]["region_index"]
+        if data.get("homography") != task["source"].get("homography"):
+            raise ValueError("The AABB homography changed. Refresh regions before tracing.")
         if index >= len(data["boxes"]) or [float(data["boxes"][index][k]) for k in ("x", "y", "w", "h")] != task["source"]["region_xywh"]:
             raise ValueError("The AABB region changed. Refresh regions before tracing.")
 
@@ -490,9 +493,9 @@ class TraceService:
     def _load_claimed_region(self, task, claim_result, use_local=None):
         self.verify_source(task)
         stat = Path(task["image_path"]).stat()
-        key = (task["image_path"], stat.st_size, stat.st_mtime_ns)
+        key = (task["image_path"], stat.st_size, stat.st_mtime_ns, json.dumps(task["source"].get("homography"), sort_keys=True))
         if key != self.source_key:
-            self.source_image = QImage(task["image_path"])
+            self.source_image = rectify_image(QImage(task["image_path"]), task["source"].get("homography"))
             self.source_key = key
         original = self.source_image
         if original.isNull():
@@ -568,9 +571,9 @@ class TraceService:
         """Load a region locally onto the canvas immediately without blocking on network."""
         self.verify_source(task)
         stat = Path(task["image_path"]).stat()
-        key = (task["image_path"], stat.st_size, stat.st_mtime_ns)
+        key = (task["image_path"], stat.st_size, stat.st_mtime_ns, json.dumps(task["source"].get("homography"), sort_keys=True))
         if key != self.source_key:
-            self.source_image = QImage(task["image_path"])
+            self.source_image = rectify_image(QImage(task["image_path"]), task["source"].get("homography"))
             self.source_key = key
         original = self.source_image
         if original.isNull():

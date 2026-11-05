@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from PyQt6.QtCore import QThread, QEvent
 from core.api_client import APIClient, OfflineError, TaskConflictError
 from tasks.obb.strategy import OBBStrategy
+from tasks.polygon.strategy import PolygonStrategy, encode_polygons, decode_polygons
 from tasks.aabb.strategy import AABBStrategy
 from tasks.svg.strategy import SVGStrategy
 from tasks.classify.strategy import ClassifyStrategy
@@ -29,6 +30,7 @@ class DataManager:
 
         self.strategies = {
             "obb": OBBStrategy("obb"),
+            "polygon": PolygonStrategy("polygon"),
             "aabb": AABBStrategy("aabb"),
             "svg": SVGStrategy("svg"),
             "classify": ClassifyStrategy("classify")
@@ -121,18 +123,21 @@ class DataManager:
         if not output_path or not os.path.isfile(output_path):
             return None
         try:
+            if task_type == "polygon":
+                return {"points": decode_polygons(Path(output_path).read_text(encoding="utf-8"))}
             data = json.loads(Path(output_path).read_bytes())
             if not isinstance(data, dict):
                 return None
             if task_type == "obb" and isinstance(data.get("board_obb"), list):
                 return {"points": data["board_obb"]}
             if task_type == "aabb" and isinstance(data.get("boxes"), list):
-                return {"points": data["boxes"]}
+                return {"points": data["boxes"], **({"homography": data["homography"]} if "homography" in data else {})}
             if task_type == "classify" and data.get("label") in ("handwriting", "sketch"):
                 return {"points": [{
                     "label": data["label"],
                     "image_sha256": data.get("image_sha256", task.get("image_sha256")),
-                    "crop": data.get("crop", task.get("crop"))
+                    "crop": data.get("crop", task.get("crop")),
+                    **({"homography": data["homography"]} if "homography" in data else {})
                 }]}
         except (OSError, ValueError):
             return None
@@ -169,10 +174,15 @@ class DataManager:
     def write_local_output(self, task_type: str, task: Dict, result_payload: Dict):
         output_path = Path(task["output_path"])
         points = result_payload.get("points", []) if isinstance(result_payload, dict) else result_payload
+        if task_type == "polygon":
+            atomic_write(output_path, encode_polygons(points).encode("utf-8"))
+            return
         if task_type == "obb":
             payload = {"board_obb": points}
         elif task_type == "aabb":
             payload = {"boxes": points}
+            if isinstance(result_payload, dict) and result_payload.get("homography") is not None:
+                payload["homography"] = result_payload["homography"]
         elif task_type == "classify":
             saved = points[0] if isinstance(points, list) and points else (result_payload if isinstance(result_payload, dict) else {})
             payload = {
@@ -185,6 +195,8 @@ class DataManager:
                 "annotator": self.api.user_id,
                 "label": saved.get("label")
             }
+            if saved.get("homography") is not None:
+                payload["homography"] = saved["homography"]
         else:
             return
         atomic_write(output_path, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"))
@@ -193,6 +205,7 @@ class DataManager:
         with self._lock:
             tasks = list(self.cached_tasks.get(task_type, []))
             self.status_cache.setdefault(task_type, {})
+            before_refresh = dict(self.status_cache[task_type])
         if not tasks:
             if refresh and not self.api.online:
                 try:
@@ -211,7 +224,9 @@ class DataManager:
                 new_cache.update({item["task_id"]: item for item in remote_list})
                 with self._lock:
                     cache = self.status_cache.setdefault(task_type, {})
-                    cache.clear()
+                    for tid in task_ids:
+                        if cache.get(tid) is not before_refresh.get(tid):
+                            new_cache[tid] = cache[tid]
                     cache.update(new_cache)
                 # Only an explicit server 'available' can invalidate local exports.
                 # Do not delete on offline/unknown statuses or active/pending saves.
@@ -225,6 +240,8 @@ class DataManager:
                 with self._lock:
                     cache = self.status_cache.setdefault(task_type, {})
                     for tid in task_ids:
+                        if cache.get(tid) is not before_refresh.get(tid):
+                            continue
                         previous = cache.get(tid, {})
                         cache[tid] = {"task_id": tid, "status": "unknown",
                                       "locked_by": previous.get("locked_by"),

@@ -52,7 +52,7 @@ class ImageCanvas(QGraphicsView):
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
-        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
+        self.setResizeAnchor(QGraphicsView.ViewportAnchor.AnchorViewCenter)
         
         self._is_panning = False
         self._pan_start = QPoint()
@@ -153,7 +153,7 @@ class ImageCanvas(QGraphicsView):
         margin = max(pixmap.width(), pixmap.height())
         self.setSceneRect(-margin, -margin, pixmap.width() + 2 * margin, pixmap.height() + 2 * margin)
         
-        self.centerOn(self.image_item)
+        self.centerOn(self.image_item.sceneBoundingRect().center())
 
     def load_existing_points(self, points_data: List[Dict]):
         for pt in self.points:
