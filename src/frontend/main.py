@@ -126,7 +126,7 @@ class MainWindow(QMainWindow):
         for screen in self.workspace_screens.values():
             if hasattr(screen, "shutdown_async"):
                 screen.shutdown_async()
-                for lane in (screen._network_lane, screen._status_lane, screen._claim_lane, screen._file_lane):
+                for lane in (screen._network_lane, screen._status_lane, screen._claim_lane, screen._file_lane, screen._save_file_lane):
                     if not lane.wait(1000):
                         self.status_bar.showMessage("Still stopping a background thread; retry closing.")
                         event.ignore()

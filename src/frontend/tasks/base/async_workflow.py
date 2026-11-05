@@ -24,6 +24,7 @@ class AsyncTaskWorkflow:
         # Claims run independently of the Save/Submit network queue.
         self._claim_lane = BackgroundLane(self)
         self._file_lane = BackgroundLane(self)
+        self._save_file_lane = BackgroundLane(self)
         self._callbacks = {}
         self._job_number = 0
         self._select_number = 0
@@ -40,10 +41,12 @@ class AsyncTaskWorkflow:
         self._status_lane.completed.connect(self._task_job_completed)
         self._claim_lane.completed.connect(self._task_job_completed)
         self._file_lane.completed.connect(self._task_job_completed)
+        self._save_file_lane.completed.connect(self._task_job_completed)
         self._network_lane.start()
         self._status_lane.start()
         self._claim_lane.start()
         self._file_lane.start()
+        self._save_file_lane.start()
         self._renew_timer = QTimer(self)
         self._renew_timer.timeout.connect(self._renew_leases)
         self._renew_timer.start(30000)
@@ -68,6 +71,7 @@ class AsyncTaskWorkflow:
         self._callbacks[job_id] = (done, failed)
         worker = (self._claim_lane if lane == "claim" else
                   self._status_lane if lane == "status" else
+                  self._save_file_lane if lane == "save_file" else
                   self._network_lane if lane == "network" else self._file_lane)
         worker.submit(job_id, function, priority=priority)
 
@@ -486,7 +490,7 @@ class AsyncTaskWorkflow:
                     self.data_manager.active_saves.discard(tid)
                 self.status_label.setText(
                     "Saved to MongoDB but local export failed. Recovery retained: " + str(exc))
-            self._enqueue("file", export_local, exported, export_failed, priority=1)
+            self._enqueue("save_file", export_local, exported, export_failed, priority=1)
         def save_error(exc):
             with self.data_manager._lock:
                 self.data_manager.active_saves.discard(tid)
@@ -500,7 +504,7 @@ class AsyncTaskWorkflow:
             QMessageBox.warning(self, "Background save failed",
                 "The server did not confirm this Save. " + msg + "\n" + str(exc) +
                 "\nReopen the task and retry Save after resolving the issue.")
-        self._enqueue("file", prepare, file_ready, save_error, priority=1)
+        self._enqueue("save_file", prepare, file_ready, save_error, priority=0)
 
     def async_next(self, after_task_id=None, skipped=None):
         if self.current_task is not None or self._claiming:
@@ -585,5 +589,5 @@ class AsyncTaskWorkflow:
         app = QApplication.instance()
         if app is not None:
             app.removeEventFilter(self)
-        for lane in (self._network_lane, self._status_lane, self._claim_lane, self._file_lane):
+        for lane in (self._network_lane, self._status_lane, self._claim_lane, self._file_lane, self._save_file_lane):
             lane.stop_after_jobs()
