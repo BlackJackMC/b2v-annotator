@@ -7,6 +7,7 @@ from ui.screens.login import LoginScreen
 from ui.screens.task_select import TaskSelectScreen
 
 from tasks.obb.screen import OBBTaskScreen
+from tasks.polygon.screen import PolygonTaskScreen
 from tasks.aabb.screen import AABBTaskScreen
 from tasks.svg.screen import SVGTaskScreen
 from tasks.classify.screen import ClassifyTaskScreen
@@ -65,6 +66,8 @@ class MainWindow(QMainWindow):
         if task_type not in self.workspace_screens:
             if task_type == "obb":
                 self.workspace_screens[task_type] = OBBTaskScreen(self.api, self.data_manager, self.goto_menu)
+            elif task_type == "polygon":
+                self.workspace_screens[task_type] = PolygonTaskScreen(self.api, self.data_manager, self.goto_menu)
             elif task_type == "aabb":
                 self.workspace_screens[task_type] = AABBTaskScreen(self.api, self.data_manager, self.goto_menu)
             elif task_type == "svg":
@@ -82,6 +85,8 @@ class MainWindow(QMainWindow):
             
             if task_type == "obb":
                 self.status_bar.showMessage("Shortcuts: [Click] Add Point | [Esc] Reset | [Ctrl + S] Save & Next | [Middle/Right Drag] Pan")
+            elif task_type == "polygon":
+                self.status_bar.showMessage("[Left Click] Four corners | [Drag corner/interior] Edit/move | [Esc] Cancel drawing | [Delete] Delete selection | [Ctrl+S] Save | [Middle Drag] Pan | [Wheel] Zoom")
             elif task_type == "aabb":
                 self.status_bar.showMessage("Shortcuts: [Left Drag] Draw Box | [Left Click] Select Box | [Left Drag on Edge] Move edge | [Delete] Delete selected | [Ctrl + S] Save & Next | [Middle Drag] Pan")
             elif task_type == "svg":
@@ -121,7 +126,7 @@ class MainWindow(QMainWindow):
         for screen in self.workspace_screens.values():
             if hasattr(screen, "shutdown_async"):
                 screen.shutdown_async()
-                for lane in (screen._network_lane, screen._status_lane, screen._claim_lane, screen._file_lane):
+                for lane in (screen._network_lane, screen._status_lane, screen._claim_lane, screen._file_lane, screen._save_file_lane):
                     if not lane.wait(1000):
                         self.status_bar.showMessage("Still stopping a background thread; retry closing.")
                         event.ignore()

@@ -7,6 +7,7 @@ from typing import Dict, List, Optional
 from PyQt6.QtCore import QThread, QEvent
 from core.api_client import APIClient, OfflineError, TaskConflictError
 from tasks.obb.strategy import OBBStrategy
+from tasks.polygon.strategy import PolygonStrategy, encode_polygons, decode_polygons
 from tasks.aabb.strategy import AABBStrategy
 from tasks.svg.strategy import SVGStrategy
 from tasks.classify.strategy import ClassifyStrategy
@@ -29,6 +30,7 @@ class DataManager:
 
         self.strategies = {
             "obb": OBBStrategy("obb"),
+            "polygon": PolygonStrategy("polygon"),
             "aabb": AABBStrategy("aabb"),
             "svg": SVGStrategy("svg"),
             "classify": ClassifyStrategy("classify")
@@ -121,6 +123,8 @@ class DataManager:
         if not output_path or not os.path.isfile(output_path):
             return None
         try:
+            if task_type == "polygon":
+                return {"points": decode_polygons(Path(output_path).read_text(encoding="utf-8"))}
             data = json.loads(Path(output_path).read_bytes())
             if not isinstance(data, dict):
                 return None
@@ -170,6 +174,9 @@ class DataManager:
     def write_local_output(self, task_type: str, task: Dict, result_payload: Dict):
         output_path = Path(task["output_path"])
         points = result_payload.get("points", []) if isinstance(result_payload, dict) else result_payload
+        if task_type == "polygon":
+            atomic_write(output_path, encode_polygons(points).encode("utf-8"))
+            return
         if task_type == "obb":
             payload = {"board_obb": points}
         elif task_type == "aabb":

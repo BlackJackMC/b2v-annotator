@@ -25,6 +25,11 @@ class TaskSelectScreen(QWidget):
         btn_aabb.clicked.connect(lambda: self.on_task_selected("aabb"))
         layout.addWidget(btn_aabb, alignment=Qt.AlignmentFlag.AlignCenter)
 
+        btn_polygon = QPushButton("Annotate Polygons (4 corners)")
+        btn_polygon.setFixedSize(300, 50)
+        btn_polygon.clicked.connect(lambda: self.on_task_selected("polygon"))
+        layout.addWidget(btn_polygon, alignment=Qt.AlignmentFlag.AlignCenter)
+
         btn_svg = QPushButton("Trace SVG")
         btn_svg.setFixedSize(300, 50)
         btn_svg.clicked.connect(lambda: self.on_task_selected("svg"))
