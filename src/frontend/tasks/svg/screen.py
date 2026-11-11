@@ -1119,6 +1119,9 @@ class SVGTaskScreen(QWidget):
             return
         source = self.copied_tracing["task"]["source"]
         target = self.current_task["source"]
+        if source.get("homography") != target.get("homography"):
+            self.show_status("Cannot paste between different homography coordinate spaces without changing the tracing.")
+            return
         if source["image_size"] != target["image_size"]:
             self.show_status("Image dimensions differ. Paste requires matching image sizes to preserve positions and widths.")
             return
