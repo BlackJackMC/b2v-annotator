@@ -76,6 +76,7 @@ class APIClient:
             for offset in range(0, len(task_ids), 200):
                 data = self.post("/tasks", {"task_ids": task_ids[offset:offset + 200]})
                 for item in data.get("tasks", []):
+                    item["has_result"] = item.get("result") is not None or item.get("has_result", False)
                     if not include_results:
                         item.pop("result", None)
                     tasks.append(item)

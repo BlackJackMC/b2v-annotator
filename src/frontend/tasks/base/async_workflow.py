@@ -97,6 +97,7 @@ class AsyncTaskWorkflow:
             self.data_manager.status_cache.setdefault(self.task_type, {})[tid] = {
                 "task_id": tid, "status": status, "locked_by": owner,
                 "result": result,
+                "has_result": result is not None or status == "done",
             }
         self.sync_data()
 
@@ -153,12 +154,19 @@ class AsyncTaskWorkflow:
                 tid = task["task_id"]
                 st = statuses.get(tid, {})
                 status = st.get("status")
+                completed = status == "done" or st.get("has_result", False)
                 if tid in self._saving:
                     label = "[saving] "
                 elif tid in self._claiming:
                     label = "[claiming…] "
                 elif status == "done":
                     label = "[done] "
+                elif completed and (status == "unknown" or st.get("status_unverified")):
+                    label = "[saved / status unverified] "
+                elif completed and status == "processing":
+                    label = "[saved / editing by you] " if st.get("locked_by") == self.api.user_id else "[saved / editing by another annotator] "
+                elif completed:
+                    label = "[saved / lock expired] "
                 elif tid in self._claimed_tasks or (status == "processing" and st.get("locked_by") == self.api.user_id):
                     label = "[claimed by you] "
                 elif status == "processing":
@@ -170,7 +178,7 @@ class AsyncTaskWorkflow:
                 else:
                     label = "[available] "
                 text = label + task.get("label", tid)
-                target = self.history_list if status == "done" and tid not in self._saving else self.processing_list
+                target = self.history_list if completed and tid not in self._saving else self.processing_list
                 state = (text, target is self.history_list)
                 if self._row_states.get(tid) == state:
                     continue
@@ -519,7 +527,7 @@ class AsyncTaskWorkflow:
         for task in candidates:
             tid = task["task_id"]
             st = states.get(tid, {})
-            if tid in skipped or tid in self._saving or tid in self._claiming or st.get("status") not in ("available", "expired", "processing"):
+            if tid in skipped or tid in self._saving or tid in self._claiming or st.get("has_result") or st.get("status") not in ("available", "expired", "processing"):
                 continue
             if st.get("status") == "processing" and st.get("locked_by") != self.api.user_id:
                 continue
@@ -584,6 +592,12 @@ class AsyncTaskWorkflow:
     def shutdown_async(self):
         if self._shutting_down:
             return
+        self.sync_timer.stop()
+        for tid in list(self._claimed_tasks):
+            if tid not in self._saving and tid not in self._failed_saves:
+                self._enqueue("network", lambda task_id=tid: self.api.unclaim_task(task_id, raise_on_error=True),
+                              lambda _: None, lambda error: self.status_label.setText("Could not release task: " + str(error)), priority=1)
+                self._claimed_tasks.pop(tid, None)
         self._shutting_down = True
         self._renew_timer.stop()
         app = QApplication.instance()
