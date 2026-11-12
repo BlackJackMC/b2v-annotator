@@ -228,11 +228,6 @@ class DataManager:
                         if cache.get(tid) is not before_refresh.get(tid):
                             new_cache[tid] = cache[tid]
                     cache.update(new_cache)
-                # Only an explicit server 'available' can invalidate local exports.
-                # Do not delete on offline/unknown statuses or active/pending saves.
-                for task in tasks:
-                    if new_cache.get(task["task_id"], {}).get("status") == "available":
-                        self.cleanup_available_json(task_type, task)
             except (OfflineError, TaskConflictError):
                 # A failed/partial refresh cannot authenticate status. Never
                 # manufacture Done from a file or reuse a stale Available row.
@@ -245,6 +240,7 @@ class DataManager:
                         previous = cache.get(tid, {})
                         cache[tid] = {"task_id": tid, "status": "unknown",
                                       "locked_by": previous.get("locked_by"),
+                                      "has_result": previous.get("has_result", False) or previous.get("status") == "done",
                                       "status_unverified": True}
 
         with self._lock:
