@@ -1,4 +1,5 @@
 import json
+import sys
 from pathlib import Path
 from typing import Dict, List
 import requests
@@ -28,6 +29,9 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
         self.source_image = None
         self.source_preview = None
         self.history = []
+        self.task_history = []
+        self._last_task_id = None
+        self._navigating_back = False
         self.shortcuts = []
         self.close_target = None
         self.sync_timer = QTimer(self)
@@ -52,14 +56,14 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
         choices = QHBoxLayout()
         choices.setSpacing(24)
         self.label_buttons = {}
-        for label, text in [("handwriting", "Handwriting\nLetters, words, numbers, formulas\n[1] or [H]"),
+        for label, text in [("handwriting", "Handwriting\nLetters, words, numbers, formulas\n[1]"),
                             ("sketch", "Sketch\nDrawings, diagrams, visual shapes\n[2] or [K]")]:
             button = QPushButton(text)
             button.setObjectName(label + "Button")
             button.setCheckable(True)
             button.setMinimumHeight(150)
             button.setCursor(Qt.CursorShape.PointingHandCursor)
-            button.setToolTip("1 / H" if label == "handwriting" else "2 / K")
+            button.setToolTip("1" if label == "handwriting" else "2 / K")
             button.clicked.connect(lambda checked, value=label: self.choose_label(value))
             self.label_buttons[label] = button
             choices.addWidget(button, stretch=1)
@@ -99,13 +103,14 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
         fit_button.setToolTip("Fit image (F)")
         fit_button.clicked.connect(self.canvas.fit_image)
         right.addWidget(fit_button)
+        mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
         self.clear_button = QPushButton("Clear choice (Esc)")
-        self.clear_button.setToolTip("Clear choice (Esc); Undo (Ctrl+Z) restores it.")
+        self.clear_button.setToolTip("Clear choice (Esc)")
         self.clear_button.clicked.connect(lambda: self.choose_label(None))
         right.addWidget(self.clear_button)
-        self.save_button = QPushButton("Save && Next (Ctrl+S)")
+        self.save_button = QPushButton(f"Save && Next ({mod}+S / H)")
         self.save_button.setObjectName("saveButton")
-        self.save_button.setToolTip("Save and open the next region (Ctrl+S)")
+        self.save_button.setToolTip(f"Save and open the next region ({mod}+S or H)")
         self.save_button.clicked.connect(self.save_and_submit)
         self.save_button.setMinimumHeight(52)
         right.addWidget(self.save_button)
@@ -113,10 +118,12 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
 
     def init_shortcuts(self):
         for key, callback in [
-            ("1", lambda: self.choose_label("handwriting")), ("H", lambda: self.choose_label("handwriting")),
+            ("1", lambda: self.choose_label("handwriting")),
             ("2", lambda: self.choose_label("sketch")), ("K", lambda: self.choose_label("sketch")),
-            ("Escape", lambda: self.choose_label(None)), ("Ctrl+Z", self.undo),
-            ("Ctrl+S", self.save_and_submit), ("F", self.canvas.fit_image)
+            ("Escape", lambda: self.choose_label(None)),
+            ("Ctrl+Z", self.go_to_previous_task),
+            ("Ctrl+S", self.save_and_submit), ("H", self.save_and_submit),
+            ("F", self.canvas.fit_image)
         ]:
             shortcut = QShortcut(QKeySequence(key), self)
             shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
@@ -137,14 +144,58 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
             self.selected_label = self.history.pop()
             self.update_choice()
 
+    def go_to_previous_task(self):
+        if self._shutting_down or self.export_pending is not None:
+            return
+        mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
+        use_last = False
+        if self.current_task is None and self._last_task_id is not None:
+            prev_tid = self._last_task_id
+            use_last = True
+        elif self.task_history:
+            prev_tid = self.task_history[-1]
+        else:
+            self.status_label.setText("No previous image in history.")
+            return
+
+        if prev_tid in self._saving or prev_tid in self._claiming:
+            self.status_label.setText(f"Saving previous image; press {mod}+Z again in a moment.")
+            return
+        with self.data_manager._lock:
+            if prev_tid in self.data_manager.active_saves:
+                self.status_label.setText(f"Finishing local export; press {mod}+Z again in a moment.")
+                return
+
+        tasks = self.data_manager.cached_tasks.get(self.task_type, [])
+        prev_task = next((t for t in tasks if t["task_id"] == prev_tid), None)
+        if prev_task is None:
+            if use_last:
+                self._last_task_id = None
+            else:
+                self.task_history.pop()
+            self.status_label.setText("Previous image is no longer in the task list.")
+            return
+
+        before_select = self._select_number
+        self._navigating_back = True
+        self.async_open(prev_task, reopen=True)
+        if self._select_number != before_select:
+            if use_last:
+                self._last_task_id = None
+            else:
+                self.task_history.pop()
+        else:
+            self._navigating_back = False
+
     def update_choice(self):
+        mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
         editable = self.current_task is not None and self.export_pending is None
         for label, button in self.label_buttons.items():
             button.setChecked(label == self.selected_label)
             button.setEnabled(editable)
         self.clear_button.setEnabled(editable)
         self.save_button.setEnabled(self.current_task is not None and self.selected_label is not None)
-        self.selection_label.setText(f"Selected: {self.selected_label.title()} · Ctrl+S to save"
+        self.selection_label.setText(f"Selected: {self.selected_label.title()} · {mod}+S or H to save"
                                      if self.selected_label else "Choose one label, then save.")
 
     def sync_suffix(self) -> str:
@@ -199,6 +250,12 @@ class ClassifyTaskScreen(AsyncTaskWorkflow, QWidget):
 
     def set_current_task(self, task, prepared=None):
         if task:
+            if self._last_task_id is not None and self._last_task_id != task["task_id"]:
+                if not self._navigating_back:
+                    if not self.task_history or self.task_history[-1] != self._last_task_id:
+                        self.task_history.append(self._last_task_id)
+            self._navigating_back = False
+            self._last_task_id = task["task_id"]
             if prepared is not None:
                 # QImage decoded in FILE lane, QPixmap produced only in GUI thread.
                 original = prepared

@@ -82,6 +82,7 @@ class SVGTaskScreen(QWidget):
         self.init_ui()
         self.init_shortcuts()
         QApplication.instance().installEventFilter(self)
+        QApplication.instance().focusChanged.connect(self._on_focus_changed)
         self.panel_animation = QVariantAnimation(self)
         self.panel_animation.setDuration(140)
         self.panel_animation.setEasingCurve(QEasingCurve.Type.OutCubic)
@@ -472,6 +473,17 @@ class SVGTaskScreen(QWidget):
                 shortcut.activated.connect(lambda n=name, f=callback: self.invoke_action(n, f))
                 shortcuts[identifier] = shortcut
             shortcut.setKey(QKeySequence(self.active_bindings[name]))
+
+    def _on_focus_changed(self, _old, new):
+        editing_key = False
+        widget = new
+        while widget is not None and widget is not self:
+            if isinstance(widget, QKeySequenceEdit):
+                editing_key = True
+                break
+            widget = widget.parentWidget()
+        for shortcut in getattr(self, "shortcut_objects", {}).values():
+            shortcut.setEnabled(not editing_key)
 
     def invoke_action(self, name, callback):
         if self.tool_menu is not None and self.tool_menu.isVisible() and name in (

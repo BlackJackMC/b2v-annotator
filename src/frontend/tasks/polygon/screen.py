@@ -29,12 +29,8 @@ class PolygonTaskScreen(AABBTaskScreen):
         self.layout().itemAt(1).layout().insertWidget(2, save)
 
     def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_S and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            self.save_and_submit(self.canvas.get_coordinates())
-        elif event.key() == Qt.Key.Key_Escape:
+        if event.key() == Qt.Key.Key_Escape:
             self.canvas.keyPressEvent(event)
-        elif event.key() == Qt.Key.Key_I and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            self.import_current_detections()
 
     def save_and_submit(self, coords):
         if not self.current_task or self.rectifying or self.importing:
