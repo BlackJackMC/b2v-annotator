@@ -2,6 +2,7 @@ import os
 from typing import Dict, List
 from PyQt6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QListWidget, QPushButton, QMessageBox, QListWidgetItem, QLabel
 from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtGui import QKeySequence, QShortcut
 from tasks.base.async_workflow import AsyncTaskWorkflow
 from core.api_client import APIClient
 from tasks.obb.canvas import ImageCanvas
@@ -22,7 +23,21 @@ class OBBTaskScreen(AsyncTaskWorkflow, QWidget):
         self.sync_timer.timeout.connect(self.sync_data_timer)
 
         self.init_ui()
+        self.init_shortcuts()
         self.initialize_async_workflow()
+
+    def init_shortcuts(self):
+        self._save_shortcut = QShortcut(QKeySequence("Ctrl+S"), self)
+        self._save_shortcut.setContext(Qt.ShortcutContext.WidgetWithChildrenShortcut)
+        self._save_shortcut.setAutoRepeat(False)
+        self._save_shortcut.activated.connect(self._shortcut_save)
+
+    def _shortcut_save(self):
+        if not self.canvas.is_editable:
+            return
+        coords = self.canvas.get_coordinates()
+        if len(coords) == 4:
+            self.save_and_submit(coords)
 
     def init_ui(self):
         layout = QHBoxLayout(self)
@@ -99,11 +114,6 @@ class OBBTaskScreen(AsyncTaskWorkflow, QWidget):
         if event.key() == Qt.Key.Key_Escape:
             if self.current_task:
                 self.set_current_task(self.current_task)
-
-        elif event.key() == Qt.Key.Key_S and event.modifiers() == Qt.KeyboardModifier.ControlModifier:
-            coords = self.canvas.get_coordinates()
-            if len(coords) == 4:
-                self.save_and_submit(coords)
 
     def save_and_submit(self, coords):
         if not self.current_task or not coords:

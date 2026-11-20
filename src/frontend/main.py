@@ -92,7 +92,8 @@ class MainWindow(QMainWindow):
             elif task_type == "svg":
                 self.status_bar.showMessage("SVG: choose visible hints with Shortcuts below the canvas; edit bindings in Keys.")
             elif task_type == "classify":
-                self.status_bar.showMessage("[1/H] Handwriting | [2/K] Sketch | [Esc] Clear | [Ctrl+Z] Undo choice | [Ctrl+S] Save & Next | [F] Fit | [Wheel] Zoom | [Drag] Pan")
+                mod = "Cmd" if sys.platform == "darwin" else "Ctrl"
+                self.status_bar.showMessage(f"[1] Handwriting | [2/K] Sketch | [Esc] Clear | [{mod}+Z] Previous image | [{mod}+S / H] Save & Next | [F] Fit | [Wheel] Zoom | [Drag] Pan")
 
     def closeEvent(self, event):
         for screen in self.workspace_screens.values():
